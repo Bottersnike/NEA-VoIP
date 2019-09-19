@@ -29,7 +29,7 @@ def db_to_thresh(db):
 def thresh_to_db(thresh):
     if thresh == 0:
         return -68
-    return (6 * math.log(abs(thresh))) / math.log(2) - 96
+    return (6 * math.log(abs(thresh))) / math.log(2) - 80
 
 
 class SocketManager:

@@ -3,6 +3,7 @@ import pyaudio
 import struct
 import numpy as np
 import time
+import math
 
 # pylint: disable=E0611
 from ._voiplib.audio import Compressor as Compressor_
@@ -205,10 +206,13 @@ class AudioIO:
             threading.Thread(target=self._handle_in_data, args=(data, sequence)).start()
 
     def _handle_in_data(self, data, sequence):
-        samps = struct.unpack('!{}h'.format(len(data) // 2), data)
+        samps = np.ndarray((len(data) // 2), '<h', data).astype(np.int32)
         #amp = max(map(abs, samps))# / len(samps)
-        amp = (sum(i*i for i in map(abs, samps)) / len(samps)) ** 0.5
-        amp = round(amp)
+        amp = np.sqrt(np.mean(samps ** 2))
+        amp = int(amp)
+
+        print(('*' * int((amp / 32768) * 500)).center(300))
+        #print(amp)
 
         for i in self.pipeline:
             #start = time.time()
