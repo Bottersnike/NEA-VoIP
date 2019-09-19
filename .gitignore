@@ -1,0 +1,7 @@
+*.egg-info
+*.pyc
+__pycache__/*
+.coverage
+.vscode
+build/
+*.dot

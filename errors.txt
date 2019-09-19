@@ -1,0 +1,80 @@
+packets.Packet.from_pipe:
+    Forgot "timestamp += cls.EPOCH"
+    Tests were failing
+packets.Packet.digest:
+    Changed to "not (0 <= self.timestamp - self.EPOCH <= 0xff_ff)"
+    Was "0 > self.timestamp - self.EPOCH > 0xff_ff"
+    Tests were failing
+
+util.read:
+    Exception in thread Thread-1:
+    Traceback (most recent call last):
+    File "C:\Program Files\Python37\lib\threading.py", line 926, in _bootstrap_inner
+        self.run()
+    File "C:\Program Files\Python37\lib\threading.py", line 870, in run
+        self._target(*self._args, **self._kwargs)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\packet_flow.py", line 83, in _handler_loop
+        packet = Packet.from_pipe(sock)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\packets.py", line 47, in from_pipe
+        head = util.read(pipe, 8)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\util.py", line 8, in read
+        data += recv(length - len(data))
+    TypeError: 'NoneType' object is not callable
+
+    "recv" was spelt "revc"
+    Failed to be caught by unit tests
+
+send():
+    Traceback (most recent call last):
+    File "server.py", line 28, in <module>
+        Server().mainloop()
+    File "server.py", line 23, in mainloop
+        self.sock.send_packet(AUDIO, pkt[2].payload, to=pkt[0])
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\packet_flow.py", line 207, in send_packet
+        self.send(packet.digest(), to=to)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\packet_flow.py", line 84, in send
+        return to.send(data)
+    ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+
+    Disconnected clients was handled in receive, but not in send
+
+udp_mainloop:
+    Exception in thread Thread-3:
+    Traceback (most recent call last):
+    File "C:\Program Files\Python37\lib\threading.py", line 926, in _bootstrap_inner
+        self.run()
+    File "C:\Program Files\Python37\lib\threading.py", line 870, in run
+        self._target(*self._args, **self._kwargs)
+    File "server.py", line 37, in udp_mainloop
+        for i in self.udp_listeners:
+    RuntimeError: dictionary changed size during iteration
+
+    Dictionaries aren't threadsafe
+    Solution was to add a mutex to that dictionary
+
+get_packet:
+    Exception in thread Thread-5:
+    Traceback (most recent call last):
+    File "C:\Program Files\Python37\lib\threading.py", line 926, in _bootstrap_inner
+        self.run()
+    File "C:\Program Files\Python37\lib\threading.py", line 870, in run
+        self._target(*self._args, **self._kwargs)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\voiplib\packet_flow.py", line 296, in do_tcp_server_auth
+        hello = self.get_packet(True, check=check, in_auth=True)
+    File "C:\Users\Nathan\Documents\Schoolwork\2018-19\CS\NEA\Project\Code\voiplib\packet_flow.py", line 190, in get_packet
+        if check is not None and not check(queue[n]):
+    IndexError: list index out of range
+
+    Locks weren't being properly claimed
+
+audio.c:
+    Large memory leak. PyMem_Malloc was being used, but not freed.
+
+    old:
+        return PyBytes_FromStringAndSize(data_out, dlen)
+
+    new:
+        PyObject *result = PyBytes_FromStringAndSize(data_out, dlen);
+        PyMem_Free(data_out);
+        return result;
+
