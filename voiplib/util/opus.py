@@ -1,11 +1,16 @@
 from ctypes import (
-    POINTER, c_int, c_int32, c_char_p, Structure, c_int16, CDLL, byref, cast, c_char
+    POINTER, c_int, c_int32, c_char_p, Structure, c_int16, CDLL, byref, cast, c_char, cdll
 )
+import ctypes.util
 import array
+import sys
 import os
 
 
-opuslib = CDLL(os.path.join(os.path.dirname(__file__), '../bin/libopus-0.x64.dll'))
+if sys.platform == 'win32':
+    opuslib = CDLL(os.path.join(os.path.dirname(__file__), '../bin/libopus-0.x64.dll'))
+else:
+    opuslib = cdll.LoadLibrary(ctypes.util.find_library('opus'))
 
 
 class OpusEncoder_(Structure): pass
