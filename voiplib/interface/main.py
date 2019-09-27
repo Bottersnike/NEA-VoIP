@@ -6,10 +6,11 @@ import math
 from PyQt4.QtCore import *
 from PyQt4.QtGui import *
 
-from ..audio import AudioIO, AudioProcessor
+from ..audio import AudioIO
+from ..audio_processors.base import AudioProcessor
 from ..config import *
 from ..opcodes import *
-from ..packet_flow import SocketController, SocketMode, KeyManager
+from ..socket_controller import SocketController, SocketMode, KeyManager
 
 CLEAR_SCROLL = """
 QScrollArea { background: transparent; border: none; }

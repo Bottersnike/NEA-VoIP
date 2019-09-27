@@ -1,57 +1,13 @@
-import heapq
 import struct
 import threading
 import traceback
 
 from . import loggers
-from .audio import AudioIO, AudioProcessor, Gate, Compressor
+from .audio import AudioIO
+from .audio_processors import Gate, Compressor, NullSink, TransmitAudio
 from .config import TCP_PORT, SERVER
 from .opcodes import AUDIO, REGISTER_UDP, SET_GATE, SET_COMP
-from .packet_flow import SocketController, SocketMode, KeyManager
-
-
-class TransmitAudio(AudioProcessor):
-    def __init__(self, sock):
-        self.sock = sock
-
-    def process(self, data, sequence, amp):
-        data = struct.pack('!H', amp) + data
-        self.sock.send_packet(AUDIO, data, sequence=sequence)
-
-    def clone(self):
-        return self.__class__(self.sock)
-
-
-class JitterBuffer(AudioProcessor):
-    ROLLOVER = 50
-    BUFFER = 5
-
-    def __init__(self):
-        self.latest = 0
-        self.heap = []
-
-    def process(self, data, packet, *_):
-        if self.ROLLOVER < packet.sequence < self.latest:
-            return None
-        heapq.heappush(self.heap, (packet.sequence, data))
-
-        while len(self.heap) >= self.BUFFER:
-            popped = heapq.heappop(self.heap)
-            if self.latest >= popped[0] > self.ROLLOVER:
-                continue
-            if self.latest == 0:
-                self.latest = popped[0]
-            else:
-                self.latest += 1
-            # if self.latest != popped[0]:
-            #    heapq.heappush(self.heap, (packet.sequence, data))
-            return popped[1]
-        return None
-
-
-class NullSink(AudioProcessor):
-    def process(self, *args):
-        return None
+from .socket_controller import SocketController, SocketMode, KeyManager
 
 
 class Client:
@@ -152,6 +108,7 @@ class Client:
 
 def main(*args, **kwargs):
     while True:
+        # noinspection PyBroadException
         try:
             Client(*args, **kwargs).mainloop()
         except ConnectionRefusedError:
