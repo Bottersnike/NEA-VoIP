@@ -16,6 +16,10 @@ SET_GATE = 12
 SET_COMP = 13
 SET_ACK = 14
 SET_FAIL = 15
+CLIENT_JOIN = 16
+CLIENT_LEAVE = 17
+SET_NAME = 18
+SET_ROOMS = 19
 
 """
 Handshake packet flow is:

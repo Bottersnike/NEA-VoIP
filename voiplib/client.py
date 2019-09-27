@@ -1,13 +1,13 @@
-import threading
-import struct
 import heapq
-import time
+import struct
+import threading
+import traceback
 
-from .packet_flow import SocketController, SocketMode, KeyManager
-from .opcodes import AUDIO, REGISTER_UDP, SET_GATE, SET_COMP
-from .config import TCP_PORT, SERVER
-from .audio import AudioIO, AudioProcessor, Gate, Compressor
 from . import loggers
+from .audio import AudioIO, AudioProcessor, Gate, Compressor
+from .config import TCP_PORT, SERVER
+from .opcodes import AUDIO, REGISTER_UDP, SET_GATE, SET_COMP
+from .packet_flow import SocketController, SocketMode, KeyManager
 
 
 class TransmitAudio(AudioProcessor):
@@ -31,19 +31,19 @@ class JitterBuffer(AudioProcessor):
         self.heap = []
 
     def process(self, data, packet, *_):
-        if packet.sequence > self.ROLLOVER and packet.sequence < self.latest:
+        if self.ROLLOVER < packet.sequence < self.latest:
             return None
         heapq.heappush(self.heap, (packet.sequence, data))
 
         while len(self.heap) >= self.BUFFER:
             popped = heapq.heappop(self.heap)
-            if popped[0] <= self.latest and popped[0] > self.ROLLOVER:
+            if self.latest >= popped[0] > self.ROLLOVER:
                 continue
             if self.latest == 0:
                 self.latest = popped[0]
             else:
                 self.latest += 1
-            #if self.latest != popped[0]:
+            # if self.latest != popped[0]:
             #    heapq.heappush(self.heap, (packet.sequence, data))
             return popped[1]
         return None
@@ -56,8 +56,10 @@ class NullSink(AudioProcessor):
 
 class Client:
     def __init__(self, no_input=False, no_output=False):
-        self._alive = True
         self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+        self._alive = True
+        self.kill_me_now = threading.Event()
+        self.client_id = None
 
         self.km = KeyManager()
 
@@ -87,10 +89,11 @@ class Client:
             self.aio.back_pipeline.insert(0, NullSink())
         if no_input:
             self.aio.pipeline.insert(0, NullSink())
-        #self.aio.back_pipeline.insert(0, JitterBuffer())
+        # self.aio.back_pipeline.insert(0, JitterBuffer())
 
     def kill(self, *args):
         self._alive = False
+        self.kill_me_now.set()
 
     def tcp_mainloop(self):
         while self._alive:
@@ -98,6 +101,7 @@ class Client:
 
             if pkt[2].opcode == SET_GATE:
                 attack, hold, release, threshold, _ = struct.unpack('!4lH', pkt[2].payload)
+
                 if attack != -1:
                     self.gate.gate.attack = attack
                 if hold != -1:
@@ -106,16 +110,28 @@ class Client:
                     self.gate.gate.release = release
                 if threshold != -1:
                     self.gate.gate.threshold = threshold
+
                 self.log.debug(f'Set gate to: {attack}, {hold}, {release}, {threshold}')
             elif pkt[2].opcode == SET_COMP:
                 attack, release, threshold, _ = struct.unpack('!3lH', pkt[2].payload)
+
                 if attack != -1:
                     self.comp.comp.attack = attack
                 if release != -1:
                     self.comp.comp.release = release
                 if threshold != -1:
                     self.comp.comp.threshold = threshold
+
                 self.log.debug(f'Set comp to: {attack}, {release}, {threshold}')
+
+    def udp_mainloop(self):
+        self.aio.begin()
+
+        while self._alive:
+            pkt = self.udp_recv.get_packet(True)
+
+            if pkt[2].opcode == AUDIO:
+                self.aio.feed(pkt[2].payload, pkt[2])
 
     def mainloop(self):
         self.client_id = self.sock.do_tcp_client_auth()
@@ -128,16 +144,22 @@ class Client:
         self.sock.send_packet(REGISTER_UDP, pld)
 
         threading.Thread(target=self.tcp_mainloop, daemon=True).start()
+        threading.Thread(target=self.udp_mainloop, daemon=True).start()
 
-        self.aio.begin()
+        self.kill_me_now.wait()
+        self.log.warning('Terminating client due to dropped connection.')
 
-        while self._alive:
-            pkt = self.udp_recv.get_packet(True)
 
-            if pkt[2].opcode == AUDIO:
-                self.aio.feed(pkt[2].payload, pkt[2])
+def main(*args, **kwargs):
+    while True:
+        try:
+            Client(*args, **kwargs).mainloop()
+        except ConnectionRefusedError:
+            print('Connecting to server failed!')
+        except:
+            traceback.print_exc()
+        print('Attempting to reconnect')
 
-        self.log.warn('Terminating client due to dropped connection.')
 
 if __name__ == '__main__':
-    Client().mainloop()
+    main()

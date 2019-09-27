@@ -1,19 +1,18 @@
-import threading
-import pyaudio
 import struct
-import numpy as np
-import time
-import math
+import threading
 
+import numpy as np
+import pyaudio
+
+from . import loggers
 # pylint: disable=E0611
 from ._voiplib.audio import Compressor as Compressor_
 from ._voiplib.audio import Gate as Gate_
 from .util.opus import OpusEncoder, OpusDecoder
-from . import loggers
 
 
 class AudioProcessor:
-    def process(self, data, *args):
+    def process(self, data, packet, amp):
         return data
 
     def __call__(self, data, *args):
@@ -87,7 +86,7 @@ class Muxer:
         if client not in self._frames:
             self._frames[client] = []
 
-        frame = np.ndarray((len(frame) // 2, ), '<h', frame)# struct.unpack(f'<{len(frame) // 2}h', frame)
+        frame = np.ndarray((len(frame) // 2,), '<h', frame)
 
         self._frames[client].append(frame)
         while len(self._frames[client]) > self.BUFFER:
@@ -102,13 +101,17 @@ class Muxer:
             self._has_frame.clear()
             self._has_frame.wait()
 
-        frame = np.zeros((960, ), dtype='<i')
+        frame = np.zeros((960,), dtype='<i')
 
         for i in list(self._frames.keys()):
             if not self._frames[i]:
                 continue
-            frame += self._frames[i].pop(0)
-            frame.clip(-1<<15, (1<<15)-1)
+            layer = self._frames[i].pop(0)
+            if layer.shape != frame.shape:
+                print('Shape error!')
+                continue
+            frame += layer
+            frame.clip(-1 << 15, (1 << 15) - 1)
 
         return frame.astype('<h').tobytes('C')
 
@@ -188,11 +191,7 @@ class AudioIO:
 
         data = data[2:]
         for i in self._back_pipeline[packet.client_id]:
-            # start = time.time()
             data = i(data, packet, amp)
-            # dur = time.time() - start
-            #if dur > self.CHUNK / 44100:
-            #    print(id(i), i.__class__.__name__, dur)
             # Someone wants us to stop
             if data is None:
                 return
@@ -207,19 +206,14 @@ class AudioIO:
 
     def _handle_in_data(self, data, sequence):
         samps = np.ndarray((len(data) // 2), '<h', data).astype(np.int32)
-        #amp = max(map(abs, samps))# / len(samps)
         amp = np.sqrt(np.mean(samps ** 2))
         amp = int(amp)
 
-        print(('*' * int((amp / 32768) * 500)).center(300))
-        #print(amp)
+        if False:
+            print(('*' * int((amp / 32768) * 500)).center(300))
 
         for i in self.pipeline:
-            #start = time.time()
             data = i(data, sequence, amp)
-            #dur = time.time() - start
-            #if dur > self.CHUNK / 44100:
-            #    print(id(i), i.__class__.__name__, dur)
             # Someone wants us to stop
             if data is None:
                 break

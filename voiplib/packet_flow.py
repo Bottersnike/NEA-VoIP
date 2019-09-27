@@ -1,21 +1,20 @@
+import enum
+import hashlib
+import threading
+import time
 from socket import (
     socket, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR,
 )
-import threading
-import hashlib
-import struct
-import enum
-import time
 
-from Crypto.Util.Padding import pad, unpad
-from Crypto.PublicKey import RSA
+from Crypto import Random
 from Crypto.Cipher import PKCS1_v1_5, AES
 from Crypto.Hash import SHA
-from Crypto import Random
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad, unpad
 
 from . import loggers
-from .util.packets import Packet, PacketError
 from .opcodes import *
+from .util.packets import Packet, PacketError
 
 
 class SocketMode(enum.IntEnum):
@@ -43,7 +42,7 @@ class KeyManager:
             return None
         _, __, key, iv = r
         a = AES.new(key, AES.MODE_CBC, iv)
-        return (a, a)
+        return a, a
 
     def register(self, client_id, aes1, aes2, key, iv, sock):
         self.registered[client_id] = (aes1, aes2, key, iv)
@@ -73,6 +72,8 @@ class SocketController:
         self._mode = mode
 
         self.km = km or KeyManager()
+        self.state_manager = None
+        self.cont_state_manager = None
 
         # Create the socket(3) object
         if mode == SocketMode.TCP:
@@ -84,7 +85,7 @@ class SocketController:
         self._queue_ready = threading.Event()
         self._pa_queue_lock = threading.Lock()
         self._pa_queue_ready = threading.Event()
-        # NOTE: queue.Queue doesn't work here because of not beeing able to
+        # NOTE: queue.Queue doesn't work here because of not being able to
         #       pop an item off based on a criteria.
         self._queue = []
         self._pa_queue = []
@@ -98,7 +99,7 @@ class SocketController:
 
         # Client stuff
         self.auth_done = False
-        # self.aes = None
+        self.use_special_encryption = False
         self.send_address = None
         self.client_id = None
 
@@ -151,12 +152,19 @@ class SocketController:
             #     del self.client_aes[addr]
         self.log.info(f'Lost connection to {addr}')
 
+        if self.state_manager is not None:
+            self.state_manager.lost(sock, addr)
         self.tcp_lost_hook(sock, addr)
 
     def send(self, data, to=None):
         if self.mode == SocketMode.TCP:
             if to is None:
-                return self._sock.send(data)
+                if self.server:
+                    for i in self.clients:
+                        i[0].send(data)
+                    return
+                else:
+                    return self._sock.send(data)
             if not isinstance(to, socket):
                 to = self.km.sock_from_id(to)
             return to.send(data)
@@ -170,7 +178,7 @@ class SocketController:
 
         if self.server and self.mode == SocketMode.TCP:
             threading.Thread(
-                target=self._accepter_loop,
+                target=self._acceptor_loop,
                 daemon=True,
             ).start()
         else:
@@ -180,7 +188,7 @@ class SocketController:
                 daemon=True,
             ).start()
 
-    def _accepter_loop(self):
+    def _acceptor_loop(self):
         while True:
             conn, addr = self.accept()
             threading.Thread(
@@ -206,14 +214,14 @@ class SocketController:
                     packet = Packet.from_bytes(pdata)
             except PacketError:
                 # TODO: Proper handling here
-                self.log.warn('Invalid packet encountered')
+                self.log.warning('Invalid packet encountered')
                 continue
             except ConnectionResetError:
                 self.tcp_lost(sock, addr)
                 return
 
             # Un-apply any encryption scheme on this connection
-            if self.client_id is None:
+            if self.client_id is None or self.use_special_encryption:
                 aes = self.km.get_aes(packet.client_id)
             else:
                 aes = self.km.get_aes(self.client_id)
@@ -222,7 +230,7 @@ class SocketController:
                 try:
                     packet.payload = unpad(aes[1].decrypt(packet.payload), 16)
                 except ValueError as e:
-                    self.log.warn(f'Failed to decrypt AES: {e}')
+                    self.log.error(f'Failed to decrypt AES: {e}')
                     continue
 
             self.log.debug('{0} bytes from {1} ({2} encrypted)'.format(len(packet.payload), addr, ppl))
@@ -333,15 +341,13 @@ class SocketController:
         sentinel = Random.new().read(15 + SHA.digest_size)
         aes_key = cipher.decrypt(resp[2].payload, sentinel)
 
-
         key, iv = aes_key[:16], aes_key[32:]
         nonce = aes_key[16:32]
         aes = AES.new(key, AES.MODE_CBC, iv)
         aes2 = AES.new(key, AES.MODE_CBC, iv)
 
         # Return the encrypted nonce
-        encr = aes.encrypt(nonce)
-        self.send_packet(AES_CHECK, encr)
+        self.send_packet(AES_CHECK, aes.encrypt(nonce))
 
         # self.aes = (aes, aes2)
         self.km.register(nonce, aes, aes2, key, iv, self._sock)
@@ -388,11 +394,11 @@ class SocketController:
         iv = Random.new().read(AES.block_size)
         aes = AES.new(key, AES.MODE_CBC, iv)
         aes2 = AES.new(key, AES.MODE_CBC, iv)
-        nonce = KeyManager.generate_client_id(key)
+        client_id = KeyManager.generate_client_id(key)
 
         # Encrypt the AES parameters using RSA
         cipher = PKCS1_v1_5.new(client_key)
-        resp = cipher.encrypt(key + nonce + iv)
+        resp = cipher.encrypt(key + client_id + iv)
 
         # Send the params to the client
         self.send_packet(AES_KEY, resp, to=sock)
@@ -402,20 +408,25 @@ class SocketController:
         assert_op(nonce_resp, AES_CHECK)
 
         nonce_resp = aes2.decrypt(nonce_resp[2].payload)
-        if nonce_resp != nonce:
+        if nonce_resp != client_id:
             self.send_packet(ABRT, b'', to=sock)
             sock.close()
             raise HandshakeFailed
 
-        self.log.debug('Server-client handshake complete')
+        self.log.info('Server-client handshake complete')
 
         # Register the client
-        self.km.register(nonce, aes, aes2, key, iv, sock)
+        self.km.register(client_id, aes, aes2, key, iv, sock)
 
         self._auth_clients.append(sock)
 
         # Send the final ACK to finish the handshake
-        self.send_packet(ACK, b'', to=nonce)
+        self.send_packet(ACK, b'', to=client_id)
+
+        if self.state_manager is not None:
+            self.state_manager.new_client(sock, addr, client_id)
+        if self.cont_state_manager is not None:
+            self.cont_state_manager.new_cont_client(sock, addr, client_id)
 
     @property
     def mode(self):
