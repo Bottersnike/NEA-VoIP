@@ -17,7 +17,7 @@ class OpusEncProcessor(AudioProcessor):
         frame = self.buffer[:self.encoder.FRAME_SIZE]
         self.buffer = self.buffer[self.encoder.FRAME_SIZE:]
         if len(self.buffer) > self.encoder.FRAME_SIZE:
-            self.log.warn('Audio underrun detected! Flushing buffer!')
+            self.log.warning('Audio underrun detected! Flushing buffer!')
             self.buffer = self.buffer[:self.encoder.FRAME_SIZE]
 
         return self.encoder.encode(frame)

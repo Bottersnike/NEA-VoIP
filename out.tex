@@ -1,0 +1,5276 @@
+\subsection{scripts.tests}
+\begin{pythoncode}
+import unittest
+import io
+
+from voiplib.util.packets import Packet, PacketError
+
+
+class TestPackets(unittest.TestCase):
+    def test_forwards(self):
+        packet = Packet(0, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Manually constructed packet
+        self.assertEqual(p_bytes, b'\x00\x00\x88\x00h\x00\t\x04\xd2test data\x08\x11')
+
+    def test_raises(self):
+        packet = Packet(0, b'test data', 2e32, 0)
+        with self.assertRaises(PacketError):
+            packet.digest()
+
+        packet = Packet(0, b'a' * 0xff_ff_ff, 1563528913000, 1234)
+        with self.assertRaises(PacketError):
+            packet.digest()
+
+    def test_packet_crc(self):
+        packet = Packet(0, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Invalidate the CRC
+        p_bytes = p_bytes[:-packet.CRC_LENGTH] + (b'\0' * packet.CRC_LENGTH)
+
+        with self.assertRaises(PacketError):
+            Packet.from_bytes(p_bytes)
+
+        # Simulated pipe
+        pipe = io.BytesIO()
+        pipe.write(p_bytes)
+        pipe.seek(0)
+
+        with self.assertRaises(PacketError):
+            Packet.from_pipe(pipe)
+
+    def test_reverse(self):
+        # This is already tested in test\_forwards and can be trusted
+        packet = Packet(57, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Can we get the data back out?
+        packet2 = Packet.from_bytes(p_bytes)
+        self.assertEqual(packet2.opcode, 57)
+        self.assertEqual(packet2.payload, b'test data')
+        self.assertEqual(packet2.timestamp, 1563528913000)
+        self.assertEqual(packet2.sequence, 1234)
+
+    def test_pipes(self):
+        # This is already tested in test\_forwards and can be trusted
+        packet = Packet(57, b'test data', 1563528913000, 1234)
+        pipe = io.BytesIO()
+        pipe.write(packet.digest())
+        pipe.seek(0)
+
+        # Using the BytesIO as a simulated pipe
+        packet2 = Packet.from_pipe(pipe)
+        self.assertEqual(packet2.opcode, 57)
+        self.assertEqual(packet2.payload, b'test data')
+        self.assertEqual(packet2.timestamp, 1563528913000)
+        self.assertEqual(packet2.sequence, 1234)
+
+
+if __name__ == '__main__':
+    unittest.main()
+\end{pythoncode}
+\subsection{src.audio}
+\begin{pythoncode}
+\##define PY\_SSIZE\_T\_CLEAN
+#include <Python.h>
+
+#include "stdint.h"
+#include "stdio.h"
+
+typedef struct {
+    PyObject_HEAD
+
+    double gain;
+    double amp;
+    double _mig;
+    double _mag;
+    unsigned int _frame;
+
+    unsigned long attack;
+    unsigned long release;
+    unsigned long threshold;
+    double exp;
+    unsigned int _c_start;
+    unsigned int _c_end;
+} CompressorObject;
+
+static int Compressor_init(CompressorObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"attack", "release", "threshold", "exp", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kkk|d", kwlist,
+                                     &self->attack, &self->release,
+                                     &self->threshold, &exp))
+        return -1;
+
+    self->gain = 1;
+    self->amp = 0;
+    self->_mig = 0;
+    self->_mag = 0;
+    self->_frame = 0;
+    self->_c_start = 0;
+    self->_c_end = 0;
+
+    self->exp = exp;
+
+    return 0;
+}
+
+static PyObject* Compressor_feed(CompressorObject *self, PyObject *args) {
+    const char* data;
+    Py_ssize_t dlen;
+    if (!PyArg_ParseTuple(args, "s#", &data, &dlen))
+        return NULL;
+
+    char* data_out = PyMem_Malloc(dlen);
+
+    for (int i = 0; i < dlen; i += 2) {
+        int16_t frame_s = (int16_t)((uint8_t)data[i] | (uint8_t)data[i + 1] << 8);
+        self->_frame++;
+        double frame = (double)frame_s;
+        self->amp = ((frame < 0 ? -frame : frame) * self->exp) + (1. - self->exp) * self->amp;
+
+        if (self->amp * self->gain < self->threshold) {
+            if (self->_c_start == 0) {
+                self->_mag = self->gain;
+                self->_c_start = self->_frame;
+                self->_c_end = 0;
+            }
+            self->gain = self->_mig + (double)(self->_frame - self->_c_start) / self->release;
+            if (self->gain > 1)
+                self->gain = 1.;
+            if (self->gain > self->_mag)
+                self->_mag = self->gain;
+        } else {
+            if (self->_c_end == 0) {
+                self->_mig = self->gain;
+                self->_mag = 1. - self->_mag;
+                self->_c_end = self->_frame;
+                self->_c_start = 0;
+            }
+            self->gain = 1. - (double)(self->_frame - self->_c_end) / self->attack - self->_mag;
+            if (self->gain < 0)
+                self->gain = 0.;
+            if (self->_mig > self->gain)
+                self->_mig = self->gain;
+        }
+
+        data_out[i] = (uint8_t)((int16_t)(frame_s * self->gain) >> 0);
+        data_out[i + 1] = (uint8_t)((int16_t)(frame_s * self->gain) >> 8);
+    }
+
+    PyObject *result = PyBytes_FromStringAndSize(data_out, dlen);
+    PyMem_Free(data_out);
+    return result;
+}
+
+static PyObject* Compressor_get_attack(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->attack);
+}
+static int Compressor_set_attack(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Attack must be an integer");
+        return -1;
+    }
+    self->attack = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Compressor_get_release(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->release);
+}
+static int Compressor_set_release(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Release must be an integer");
+        return -1;
+    }
+    self->release = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Compressor_get_threshold(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->threshold);
+}
+static int Compressor_set_threshold(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Threshold must be an integer");
+        return -1;
+    }
+    self->threshold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyGetSetDef Compressor_getsetters[] = {
+    {"attack", (getter) Compressor_get_attack, (setter) Compressor_set_attack, "", NULL},
+    {"release", (getter) Compressor_get_release, (setter) Compressor_set_release, "", NULL},
+    {"threshold", (getter) Compressor_get_threshold, (setter) Compressor_set_threshold, "", NULL},
+    {NULL}
+};
+static PyMethodDef Compressor_methods[] = {
+    {"feed", (PyCFunction) Compressor_feed, METH_VARARGS, ""},
+    {NULL}
+};
+static PyTypeObject CompressorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "audio.Compressor",
+    .tp_doc = "Compressor object",
+    .tp_basicsize = sizeof(CompressorObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) Compressor_init,
+    .tp_methods = Compressor_methods,
+    .tp_getset = Compressor_getsetters,
+};
+
+typedef struct {
+    PyObject_HEAD
+
+    double gain;
+    double amp;
+    double _mig;
+    double _mag;
+    unsigned int _frame;
+
+    unsigned long attack;
+    unsigned long hold;
+    unsigned long release;
+    unsigned long threshold;
+    double exp;
+    unsigned int _c_start;
+    unsigned int _c_end;
+} GateObject;
+
+static int Gate_init(GateObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"attack", "hold", "release", "threshold", "exp", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kkkk|d", kwlist,
+                                     &self->attack, &self->hold,
+                                     &self->release, &self->threshold,
+                                     &exp))
+        return -1;
+
+    self->gain = 1;
+    self->amp = 0;
+    self->_mig = 0;
+    self->_mag = 0;
+    self->_frame = 0;
+    self->_c_start = 0;
+    self->_c_end = 0;
+
+    self->exp = exp;
+
+    return 0;
+}
+
+static PyObject* Gate_feed(GateObject *self, PyObject *args) {
+    const char* data;
+    Py_ssize_t dlen;
+    if (!PyArg_ParseTuple(args, "s#", &data, &dlen))
+        return NULL;
+
+    char* data_out = PyMem_Malloc(dlen);
+
+    for (int i = 0; i < dlen; i += 2) {
+        int16_t frame_s = (int16_t)((uint8_t)data[i] | (uint8_t)data[i + 1] << 8);
+        self->_frame++;
+        double frame = (double)frame_s;
+        self->amp = ((frame < 0 ? -frame : frame) * self->exp) + (1. - self->exp) * self->amp;
+
+        if (self->amp > self->threshold) {
+            if (self->_c_start == 0) {
+                self->_mag = self->gain;
+                self->_c_start = self->_frame;
+                self->_c_end = 0;
+            }
+            self->gain = self->_mig + (double)(self->_frame - self->_c_start) / self->attack;
+            if (self->gain > 1)
+                self->gain = 1.;
+            if (self->gain > self->_mag)
+                self->_mag = self->gain;
+        } else {
+            if (self->_c_end == 0) {
+                self->_mig = self->gain;
+                self->_mag = 1. - self->_mag;
+                self->_c_end = self->_frame;
+                self->_c_start = 0;
+            }
+            if (self->_frame - self->_c_end >= self->hold) {
+                self->gain = 1. - (double)(self->_frame - self->_c_end - self->hold) / self->release - self->_mag;
+                if (self->gain < 0)
+                    self->gain = 0.;
+            }
+            if (self->_mig > self->gain)
+                self->_mig = self->gain;
+        }
+
+        data_out[i] = (uint8_t)((int16_t)(frame_s * self->gain) >> 0);
+        data_out[i + 1] = (uint8_t)((int16_t)(frame_s * self->gain) >> 8);
+    }
+
+    PyObject *result = PyBytes_FromStringAndSize(data_out, dlen);
+    PyMem_Free(data_out);
+    return result;
+}
+
+static PyObject* Gate_get_attack(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->attack);
+}
+static int Gate_set_attack(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Attack must be an integer");
+        return -1;
+    }
+    self->attack = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_hold(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->hold);
+}
+static int Gate_set_hold(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Hold must be an integer");
+        return -1;
+    }
+    self->hold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_release(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->release);
+}
+static int Gate_set_release(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Release must be an integer");
+        return -1;
+    }
+    self->release = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_threshold(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->threshold);
+}
+static int Gate_set_threshold(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Threshold must be an integer");
+        return -1;
+    }
+
+    self->threshold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyGetSetDef Gate_getsetters[] = {
+    {"attack", (getter) Gate_get_attack, (setter) Gate_set_attack, "", NULL},
+    {"hold", (getter) Gate_get_hold, (setter) Gate_set_hold, "", NULL},
+    {"release", (getter) Gate_get_release, (setter) Gate_set_release, "", NULL},
+    {"threshold", (getter) Gate_get_threshold, (setter) Gate_set_threshold, "", NULL},
+    {NULL}
+};
+static PyMethodDef Gate_methods[] = {
+    {"feed", (PyCFunction) Gate_feed, METH_VARARGS, ""},
+    {NULL}
+};
+static PyTypeObject GateType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "audio.Gate",
+    .tp_doc = "Gate object",
+    .tp_basicsize = sizeof(GateObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) Gate_init,
+    .tp_methods = Gate_methods,
+    .tp_getset = Gate_getsetters,
+};
+
+
+static PyMethodDef ModuleMethods[] = {
+    {NULL, NULL, 0, NULL}
+};
+
+
+static struct PyModuleDef audiomodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "audio",
+    .m_doc = NULL,
+    .m_size = -1,
+    ModuleMethods
+};
+
+PyMODINIT_FUNC PyInit_audio(void) {
+    PyObject *m;
+    if (PyType_Ready(&GateType) < 0)
+        return NULL;
+    if (PyType_Ready(&CompressorType) < 0)
+        return NULL;
+
+    m = PyModule_Create(&audiomodule);
+    if (m == NULL)
+        return NULL;
+
+    Py_INCREF(&GateType);
+    PyModule_AddObject(m, "Gate", (PyObject *) &GateType);
+    Py_INCREF(&CompressorType);
+    PyModule_AddObject(m, "Compressor", (PyObject *) &CompressorType);
+    return m;
+}
+\end{pythoncode}
+\subsection{src.crc}
+\begin{pythoncode}
+\##define PY\_SSIZE\_T\_CLEAN
+#include <Python.h>
+
+#include "stdint.h"
+
+
+typedef struct {
+    PyObject_HEAD
+
+    int _size;
+    int _polynomial;
+    int table[256];
+} CRCObject;
+
+static int CRC_init(CRCObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"size", "polynomial", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kk", kwlist,
+                                     &self->_size, &self->_polynomial))
+        return -1;
+    
+    for (int i = 0; i < 256; i++) {
+        int crc_accumulator = i << (self->_size - 8);
+
+        for (int j = 0; j < 8; j++) {
+            if (crc_accumulator & (1 << (self->_size - 1)))
+                crc_accumulator = (crc_accumulator << 1) ^ self->_polynomial;
+            else
+                crc_accumulator = crc_accumulator << 1;
+        }
+        self->table[i] = crc_accumulator;
+    }
+
+    return 0;
+}
+
+static PyObject* CRC_call(CRCObject *self, PyObject *args, PyObject *kwds) {
+    const char* data;
+    Py_ssize_t dlen;
+    int accumulator = 0;
+    static char *kwlist[] = {"data", "accumulator", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#|k", kwlist,
+                                     &data, &dlen, &accumulator))
+        return NULL;
+
+    for (int i = 0; i < dlen; i++) {
+        int j = ((accumulator >> (self->_size - 8)) ^ data[i]) & 0xff;
+        accumulator = ((accumulator << 8) ^ self->table[j]) & ((1 << self->_size) - 1);
+    }
+
+    char* data_out = PyMem_Malloc(2);
+    data_out[0] = (uint8_t)(accumulator >> 8);
+    data_out[1] = (uint8_t)(accumulator);
+    return PyBytes_FromStringAndSize(data_out, 2);
+}
+
+static PyMethodDef CRC_methods[] = {
+    {NULL}
+};
+static PyTypeObject CRCType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "crc.CRC",
+    .tp_doc = "CRC object",
+    .tp_basicsize = sizeof(CRCObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) CRC_init,
+    .tp_call = CRC_call,
+    .tp_methods = CRC_methods,
+};
+
+static PyMethodDef ModuleMethods[] = {
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef crcmodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "crc",
+    .m_doc = NULL,
+    .m_size = -1,
+    ModuleMethods
+};
+
+PyMODINIT_FUNC PyInit_crc(void) {
+    PyObject *m;
+    if (PyType_Ready(&CRCType) < 0)
+        return NULL;
+
+    m = PyModule_Create(&crcmodule);
+    if (m == NULL)
+        return NULL;
+
+    Py_INCREF(&CRCType);
+    PyModule_AddObject(m, "CRC", (PyObject *) &CRCType);
+    return m;
+}
+\end{pythoncode}
+\subsection{voiplib.audioio}
+\begin{pythoncode}
+import struct
+import threading
+
+import numpy as np
+import pyaudio
+
+from .audio_processors import OpusEncProcessor, OpusDecProcessor
+from .util.packets import Packet
+from .muxer import Muxer
+from . import loggers
+
+
+class AudioIO:
+    """
+    The main class responsible for audio input, output, and pipelineing.
+    """
+
+    CHUNK = 256
+
+    def __init__(self) -> None:
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+        self.pa = pyaudio.PyAudio()
+
+        # Locate all input and output audio hardware devices
+        self.inputs = []
+        self.outputs = []
+        for i in range(self.pa.get_device_count()):
+            info = self.pa.get_device_info_by_index(i)
+            idata = (
+                i, info['name'], info['hostApi'], info['defaultSampleRate']
+            )
+            if info['maxInputChannels']:
+                self.inputs.append(idata)
+            if info['maxOutputChannels']:
+                self.outputs.append(idata)
+
+        # Bind to the most appropriate input and output devices
+        self.in_stream = self.pa.open(
+            channels=1,
+            format=8,
+            rate=int(self.inputs[0][3]),
+            input=True,
+            frames_per_buffer=self.CHUNK,
+            input_device_index=self.inputs[0][0]
+        )
+        self.out_stream = self.pa.open(
+            channels=1,
+            format=8,
+            rate=int(self.outputs[0][3]),
+            output=True,
+            frames_per_buffer=self.CHUNK,
+            input_device_index=self.outputs[0][0]
+        )
+
+        self.log.info(f'Opened "{self.inputs[0][1]}" as input')
+        self.log.info(f'   and "{self.outputs[0][1]}" as output')
+
+        # Create our two dummy pipelines
+        self.pipeline = [OpusEncProcessor()]
+        self.back_pipeline = [OpusDecProcessor()]
+        self._back_pipeline = {}
+
+        # Setup a muxer instance for the output pipeline
+        self.muxer = Muxer()
+
+    def begin(self) -> None:
+        """
+        Start the audio interface and begin feeding the pipelines
+        """
+        threading.Thread(target=self._audio_player, daemon=True).start()
+        threading.Thread(target=self._in_watcher, daemon=True).start()
+
+    def _audio_player(self) -> None:
+        """
+        Constantly flush data from the muxer and feed it to the output device
+        """
+        while True:
+            frame = self.muxer.read()
+            if frame is None:
+                continue
+            self.out_stream.write(frame)
+
+    def _new_pipeline(self, client_id: bytes) -> None:
+        """
+        Setup a new client-specific pipleine for processing pre-mix
+        """
+        self._back_pipeline[client_id] = [
+            i.clone() for i in self.back_pipeline
+        ]
+
+    def feed(self, data: bytes, packet: Packet) -> None:
+        """
+        Feed audio into the pipeline
+
+        :param bytes data: The audio data
+        :param Packet packet: The Packet, including metadata 
+        """
+        # The first two bytes of the data are an unsigned short containg the
+        # rms aplitude
+        amp = struct.unpack('!H', data[:2])[0]
+
+        # If this client doesn't exist in our pipelines, create a new one for
+        # them.
+        if packet.client_id not in self._back_pipeline:
+            self._new_pipeline(packet.client_id)
+
+        data = data[2:]
+        # Feed the data through the pipeline
+        for i in self._back_pipeline[packet.client_id]:
+            data = i(data, packet, amp)
+            # Someone wants us to stop
+            if data is None:
+                return
+
+        # Let the muxer know there's new data
+        self.muxer.write(data, packet.client_id)
+
+    def _in_watcher(self) -> None:
+        """
+        This thread monitors the incomming audio stream and spawns a new thread
+        each time there is aditional data to process.
+
+        As Python threads are very cheap to create, this is an acceptable use
+        as the execution is significantly slowed if the data handler fails to
+        complete before the next chunk of data is waiting in the buffer.
+        """
+        sequence = 0
+        while True:
+            data = self.in_stream.read(
+                self.CHUNK, exception_on_overflow=False)
+            threading.Thread(target=self._handle_in_data,
+                             args=(data, sequence)).start()
+
+    def _handle_in_data(self, data: bytes, sequence: int) -> None:
+        """
+        Processing incomming data.
+        If this data is from a socket, we will want to know the order it came
+        in. This is just transparently passed down to pipeline modules,
+        however, so is of little concern here.
+
+        :param bytes data: The raw PCM data
+        :param int sequence: The audio sequence number
+        """
+        # Calculate the RMS of the audio
+        samps = np.ndarray((len(data) // 2), '<h', data).astype(np.int32)
+        amp = np.sqrt(np.mean(samps ** 2))
+        amp = int(amp)
+
+        # Show a visualisation of the RMS, enabled for testing
+        if False:
+            print(('*' * int((amp / 32768) * 500)).center(300))
+
+        # Pass the data down through the pipeline
+        for i in self.pipeline:
+            data = i(data, sequence, amp)
+            # Someone wants us to stop
+            if data is None:
+                break
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.base}
+\begin{pythoncode}
+import abc
+
+
+class AudioProcessor(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def process(self, data, packet, amp):
+        pass
+
+    def __call__(self, data, *args):
+        return self.process(data, *args)
+
+    def clone(self):
+        return self.__class__()
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.compressor}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .._voiplib.audio import Compressor as Compressor_
+
+
+class Compressor(AudioProcessor):
+    def __init__(self, attack, release, threshold, exp=0.9):
+        self.comp = Compressor_(attack, release, threshold, exp)
+
+    def process(self, data, *args):
+        return self.comp.feed(data)
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.gate}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .._voiplib.audio import Gate as Gate_
+
+
+class Gate(AudioProcessor):
+    def __init__(self, attack, hold, release, threshold, exp=0.9):
+        self.gate = Gate_(attack, hold, release, threshold, exp)
+
+    def process(self, data, *args):
+        return self.gate.feed(data)
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.jitter\_buffer}
+\begin{pythoncode}
+import heapq
+
+from .base import AudioProcessor
+
+
+class JitterBuffer(AudioProcessor):
+    ROLLOVER = 50
+    BUFFER = 5
+
+    def __init__(self):
+        self.latest = 0
+        self.heap = []
+
+    def process(self, data, packet, *_):
+        if self.ROLLOVER < packet.sequence < self.latest:
+            return None
+        heapq.heappush(self.heap, (packet.sequence, data))
+
+        while len(self.heap) >= self.BUFFER:
+            popped = heapq.heappop(self.heap)
+            if self.latest >= popped[0] > self.ROLLOVER:
+                continue
+            if self.latest == 0:
+                self.latest = popped[0]
+            else:
+                self.latest += 1
+            # if self.latest != popped[0]:
+            #    heapq.heappush(self.heap, (packet.sequence, data))
+            return popped[1]
+        return None
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.null\_sink}
+\begin{pythoncode}
+from .base import AudioProcessor
+
+
+class NullSink(AudioProcessor):
+    def process(self, *args):
+        return None
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.opus}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .. import loggers
+from ..util.opus import OpusEncoder, OpusDecoder
+
+
+class OpusEncProcessor(AudioProcessor):
+    def __init__(self):
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+
+        self.encoder = OpusEncoder()
+        self.buffer = b''
+
+    def process(self, data, *args):
+        self.buffer += data
+        if len(self.buffer) < self.encoder.FRAME_SIZE:
+            return
+        frame = self.buffer[:self.encoder.FRAME_SIZE]
+        self.buffer = self.buffer[self.encoder.FRAME_SIZE:]
+        if len(self.buffer) > self.encoder.FRAME_SIZE:
+            self.log.warning('Audio underrun detected! Flushing buffer!')
+            self.buffer = self.buffer[:self.encoder.FRAME_SIZE]
+
+        return self.encoder.encode(frame)
+
+
+class OpusDecProcessor(AudioProcessor):
+    def __init__(self):
+        self.decoder = OpusDecoder()
+
+    def process(self, data, *args):
+        # noinspection PyBroadException
+        try:
+            return self.decoder.decode(data)
+        except:
+            return None
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.transmit\_audio}
+\begin{pythoncode}
+import struct
+
+from .base import AudioProcessor
+from ..opcodes import AUDIO
+
+
+class TransmitAudio(AudioProcessor):
+    def __init__(self, sock):
+        self.sock = sock
+
+    def process(self, data, sequence, amp):
+        data = struct.pack('!H', amp) + data
+        self.sock.send_packet(AUDIO, data, sequence=sequence)
+
+    def clone(self):
+        return self.__class__(self.sock)
+
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.\_\_init\_\_}
+\begin{pythoncode}
+from .compressor import Compressor
+from .gate import Gate
+from .jitter_buffer import JitterBuffer
+from .null_sink import NullSink
+from .opus import OpusEncProcessor, OpusDecProcessor
+from .transmit_audio import TransmitAudio
+\end{pythoncode}
+\subsection{voiplib.client}
+\begin{pythoncode}
+import struct
+import threading
+import traceback
+
+from .socket_controller import SocketController, SocketMode, KeyManager
+from .audio_processors import Gate, Compressor, NullSink, TransmitAudio
+from .audioio import AudioIO
+from .opcodes import AUDIO, REGISTER_UDP, SET_GATE, SET_COMP
+from .config import TCP_PORT, SERVER
+from . import loggers
+
+
+class Client:
+    def __init__(self, no_input: bool=False, no_output: bool=False):
+        # Create a logging instance
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+
+        # Setup kill timers to abort the client
+        self._alive = True
+        self.kill_me_now = threading.Event()
+
+        # Prepare for the state provided by the server
+        self.client_id = None
+        self.km = KeyManager()
+
+        # Setup the socket used for TCP communication
+        self.sock = SocketController(km=self.km)
+        self.sock.connect(SERVER, TCP_PORT)
+        self.sock.start()
+        self.sock.tcp_lost_hook = self.kill
+
+        # Setup the UDP socket pair for audio data
+        self.udp_send = SocketController(SocketMode.UDP, km=self.km)
+        self.udp_send.connect(SERVER, TCP_PORT)
+
+        self.udp_recv = SocketController(SocketMode.UDP, km=self.km)
+        self.udp_recv.bind('', 0)
+        self.udp_port = self.udp_recv.getsockname()[1]
+        self.udp_recv.start()
+
+        # Helper function to convert samples to ms
+        ms = lambda x: round(x * (44100 / 1000))
+        # Setup a "safe" gate and compressor
+        self.gate = Gate(ms(3.5), ms(10), ms(10), 950)
+        self.comp = Compressor(ms(1), ms(100), 10000)
+
+        # Setup the audio pipelines
+        self.aio = AudioIO()
+        self.aio.pipeline.insert(0, self.gate)
+        self.aio.pipeline.insert(0, self.comp)
+        self.aio.pipeline.append(TransmitAudio(self.udp_send))
+
+        # If we aren't actually outputting anything, add a null sink.
+        # This module never returns data, terminating the pipeline early.
+        if no_output:
+            self.aio.back_pipeline.insert(0, NullSink())
+        if no_input:
+            self.aio.pipeline.insert(0, NullSink())
+        # self.aio.back\_pipeline.insert(0, JitterBuffer())
+
+    def kill(self, *_) -> None:
+        """
+        Sets both of the death flags for the client.
+        """
+        self._alive = False
+        self.kill_me_now.set()
+
+    def tcp_mainloop(self) -> None:
+        """
+        The main loop to handle TCP communications.
+        A large amount of the TCP processing is handled by the socket
+        controller, therefore this function serves to handle other fucntions
+        such as adjusting pipeline modules.
+        """
+        while self._alive:
+            # Wait for a new packet
+            pkt = self.sock.get_packet(True)
+
+            if pkt[2].opcode == SET_GATE:
+                # Decode the payload
+                try:
+                    attack, hold, release, threshold, _ = (
+                        struct.unpack('!4lH', pkt[2].payload)
+                    )
+                except:
+                    continue
+
+                # Reassign the gate parameters
+                if attack != -1:
+                    self.gate.gate.attack = attack
+                if hold != -1:
+                    self.gate.gate.hold = hold
+                if release != -1:
+                    self.gate.gate.release = release
+                if threshold != -1:
+                    self.gate.gate.threshold = threshold
+
+                self.log.debug(f'Set gate to: {attack}, {hold}, {release}, '
+                               f'{threshold}')
+            elif pkt[2].opcode == SET_COMP:
+                # Decode the payload
+                try:
+                    attack, release, threshold, _ = (
+                        struct.unpack('!3lH', pkt[2].payload)
+                    )
+                except:
+                    continue
+
+                # Reassign the compressor parameters
+                if attack != -1:
+                    self.comp.comp.attack = attack
+                if release != -1:
+                    self.comp.comp.release = release
+                if threshold != -1:
+                    self.comp.comp.threshold = threshold
+
+                self.log.debug(f'Set comp to: {attack}, {release}, '
+                               f'{threshold}')
+
+    def udp_mainloop(self) -> None:
+        """
+        The main loop to handle UDP communication.
+        As with TCP, large portions of this are handled by the socket
+        controller; the main function of this thread is to feed incomming
+        audio into the pipeline.
+        """
+        self.aio.begin()
+
+        while self._alive:
+            # Wait for a new packet
+            pkt = self.udp_recv.get_packet(True)
+
+            if pkt[2].opcode == AUDIO:
+                # Feed the pipeline
+                self.aio.feed(pkt[2].payload, pkt[2])
+
+    def mainloop(self) -> None:
+        """
+        The main loop for the client.
+        Contrary to the naming convention, this function does no contain a
+        classical loop. Instead, it spawns child threads, then waits for the
+        death flag to be set.
+        """
+        # Perform TCP authentication before continuing
+        self.client_id = self.sock.do_tcp_client_auth()
+        # Inform the UDP controllers of the changes
+        self.udp_send.client_id = self.client_id
+        self.udp_recv.client_id = self.client_id
+
+        self.log.info(f'Received client ID: {self.client_id}')
+
+        # Inform the server as to the UDP port aquired by the client
+        pld = struct.pack('!H', self.udp_port)
+        self.sock.send_packet(REGISTER_UDP, pld)
+
+        # Spawn the two child threads
+        threading.Thread(target=self.tcp_mainloop, daemon=True).start()
+        threading.Thread(target=self.udp_mainloop, daemon=True).start()
+
+        # Wait for a death flag to be set.
+        # The only case in which this flag should be set is in the case of an
+        # unepxected disconnection from the server. In all other cases exiting
+        # should be handled gracefully by a child thread.
+        self.kill_me_now.wait()
+        self.log.warning('Terminating client due to dropped connection.')
+
+
+def main(*args, **kwargs) -> None:
+    """
+    Start a client instance, constantly respawning it in the case that it
+    should terminate unexpectedly.
+    """
+    loggers.createFileLogger(__name__)
+    log = loggers.getLogger(__name__)
+
+    while True:
+        try:
+            # Create a new client instance, and start it
+            Client(*args, **kwargs).mainloop()
+        except ConnectionRefusedError:
+            # Expected error. Show a critical warning.
+            log.critical('Connecting to server failed!')
+        except:
+            # Unexpected error, print the traceback to the console.
+            traceback.print_exc()
+        log.info('Attempting to reconnect')
+
+
+if __name__ == '__main__':
+    main()
+\end{pythoncode}
+\subsection{voiplib.config}
+\begin{pythoncode}
+HOST = '0.0.0.0'
+TCP_PORT = 25734
+
+CONTROL_PORT = 25735
+
+SERVER = 'nlaptop.local'
+\end{pythoncode}
+\subsection{voiplib.database.orm}
+\begin{pythoncode}
+import threading
+import sqlite3
+
+
+ALLOWED_TYPES = {
+    int: 'INTEGER',
+    str: 'TEXT',
+    float: 'FLOAT',
+    bool: 'BOOLEAN',
+}
+
+
+class Wrapper:
+    def __init__(self, wraps):
+        self.wraps = wraps
+
+    @classmethod
+    def __class_getitem__(cls, item):
+        return cls(item)
+    
+    def unwrap(self):
+        w = self.wraps
+        while isinstance(w, Wrapper):
+            w = w.wraps
+        return w
+
+
+class NotNull(Wrapper):
+    pass
+
+
+class Primary(Wrapper):
+    pass
+
+
+class List(Wrapper):
+    pass
+
+
+class Auto(Wrapper):
+    pass
+
+
+class List_:
+    def __init__(self, tab, record, of, items):
+        self._tab = tab
+        self._record = record
+        self._of = of
+        for i in items:
+            self.append(i)
+    
+    def append(self, i):
+        if i._id is None:
+            i._table.insert(i)
+        
+        class Doc:
+            pass
+        d = Doc()
+        d.cols = {
+            self._tab.magic[0]: getattr(self._record, self._record._table.primary._field),
+            self._tab.magic[1]: getattr(i, i._table.primary._field)
+        }
+        self._tab.magic[2].insert(d)
+    
+    def all_items(self):
+        query = f'''SELECT * FROM {self._tab.magic[2]};'''
+        return_value = []
+        ready = threading.Event()
+
+        def f():
+            cur = self._tab._db.connection.cursor()
+            cur.execute(query)
+            dat = cur.fetchall()
+            cur.close()
+            return_value.append(dat)
+            ready.set()
+        
+        self._tab._db.enqueue(f)
+        ready.wait()
+        dat = return_value.pop()
+
+        return [self._record._table(*i) for i in dat]
+
+    def __str__(self):
+        return '[' + ', '.join(map(lambda x: f'<{x}>', self.all_items())) + ']'
+
+
+class Reference:
+    def __init__(self, db, table, field, type_, original=None):
+        self._db = db
+        self._table = table
+        self._field = field
+        self._type = type_
+        self._original = original
+
+    def get_table(self):
+        return self._table
+
+    def prepare(self, simple=False):
+        stmt = defer = ''
+
+        if self._type in ALLOWED_TYPES:
+            stmt = f'{self._field} {ALLOWED_TYPES[self._type]}'
+        elif isinstance(self._type, self.__class__):
+            defer = f'FOREIGN KEY ({self._field}) REFERENCES {self._type._table}({self._type._field})'
+            ext, d = self._type.prepare(True)
+            if d:
+                defer += ',' + d
+            ext = ext.split(' ', 1)[-1]
+            stmt = str(self._field) + ' ' + ext
+
+            if simple:
+                return str(self._field) + ' ' + ext
+
+        elif isinstance(self._type, Table):
+            defer = f'FOREIGN KEY ({self._field}) REFERENCES {self._type.primary}'
+            ext, d = self._type.primary.prepare(True)
+            if d:
+                defer += ',' + d
+            ext = ext.split(' ', 1)[-1]
+            stmt = str(self._field) + ' ' + ext
+
+            if simple:
+                return str(self._field) + ' ' + ext
+
+        if self._original and not simple:
+            for i in self._original[::-1]:
+                if isinstance(i, NotNull):
+                    stmt += ' NOT NULL'
+                elif isinstance(i, Primary):
+                    stmt += ' PRIMARY KEY'
+                elif isinstance(i, Auto):
+                    stmt += ' AUTOINCREMENT'
+
+        return (stmt, defer)
+
+    def __str__(self):
+        if self._field:
+            return f'{self._table}({self._field})'
+        return self._table
+
+
+class Record:
+    def __init__(self, cols, table):
+        self.__dict__['cols'] = cols
+        self.__dict__['_table'] = table
+
+    def get_table(self):
+        return self.__dict__['_table']
+
+    def __getattr__(self, attr):
+        return self.__dict__['cols'][attr]
+    
+    def __setattr__(self, attr, value):
+        self.__dict__['cols'][attr] = value
+    
+    def __str__(self):
+        return ', '.join(f'{i}: {repr(self.__dict__["cols"][i])}' for i in self.__dict__['cols'])
+    
+    def __repr__(self):
+        return f'<{self}>'
+
+
+class Table:
+    class NoneValue:
+        pass
+
+    NoneValue = NoneValue()
+
+    def __init__(self, db, name):
+        self._db = db
+        self._name = name
+
+        self.primary = None
+        self.fields = []
+
+    def prepare(self, exist_ok=False):
+        stmt = f'CREATE TABLE {"IF NOT EXISTS " if exist_ok else ""}' + self._name + '(\n'
+
+        deferred = []
+        for i in self.fields:
+            if i._original and list in i._original:
+                continue
+            s, d = i.prepare()
+            if d:
+                deferred.append(d)
+            stmt += '  ' + s + ',\n'
+        for i in deferred:
+            stmt += '  ' + i + ',\n'
+
+        stmt = stmt.strip(',\n') + '\n'
+        stmt += ');'
+        return stmt
+
+    def __call__(self, *args, **kwargs):
+        fields = {}
+        args = list(args)
+
+        if self.fields[0] == self.primary and self.primary._field == '_id':
+            if len(args) < len(self.fields):
+                args.insert(0, None)
+     
+        for i in self.fields:
+            if i._original:
+                for j in i._original:
+                    pass
+
+                    #if isinstance(j, Auto):
+                    #    fields[j.unwrap().\_field] = self.NoneValue
+
+        for n, i in enumerate(args):
+            if len(fields) == len(self.fields):
+                raise AttributeError('Passed arguments fail to match table structure')
+            fields[self.fields[n]] = i
+        for i in kwargs:
+            if i not in self.fields or i in fields:
+                raise AttributeError('Passed arguments fail to match table structure')
+            fields[i] = kwargs[i]
+        
+        lists = [i for i in fields if isinstance(fields[i], list)]
+
+        _fields = {}
+        for i in fields:
+            _fields[i._field] = None if i in lists else fields[i]
+
+        record = Record(_fields, self)
+
+        for i in lists:
+            record.__dict__['cols'][i._field] = List_(self, record, i, fields[i])
+        return record
+
+    def __str__(self):
+        return self._name
+    
+    def select(self, **kwargs):
+        if '___database_thread' in kwargs:
+            ___database_thread = True
+            kwargs.pop('___database_thread')
+        else:
+            ___database_thread = False
+        
+        selector, args = [], []
+        fields = [i._field for i in self.fields]
+        for i in kwargs:
+            if i not in fields:
+                raise AttributeError('No column \'' + i + '\'')
+            selector.append(f'{i}=?')
+            args.append(kwargs[i])
+
+        query = f'SELECT * FROM {self._name}'
+        if selector:
+            query += f' WHERE ' + ' AND '.join(selector)
+
+        return_value = []
+        ready = threading.Event()
+
+        def f():
+            cur = self._db.connection.cursor()
+            cur.execute(query, args)
+            res = cur.fetchall()
+
+            ret = []
+            for i in res:
+                row = []
+                for j, r in zip(i, self.fields):
+                    if isinstance(r._type, Table):
+                        j = r._type.select(**{r._type.primary._field: j}, ___database_thread=True)[0]
+                    row.append(j)
+                ret.append(self(*row))
+
+            return_value.append(ret)
+            ready.set()
+        
+        if ___database_thread:
+            f()
+        else:
+            self._db._enqueue(f)
+            ready.wait()
+        return return_value[0]
+    
+    def insert(self, document):
+        args = []
+        fields = [i._field for i in self.fields]
+        
+        for i in document.cols:
+            if i not in fields:
+                raise AttributeError('No column \'' + i + '\'')
+        for i in fields:
+            if i in document.cols:
+                if isinstance(document.cols[i], Record):
+                    pk = document.cols[i].get_table()
+                    pk = getattr(document.cols[i], pk.primary._field)
+                    args.append(pk)
+                elif isinstance(document.cols[i], List_):
+                    pass
+                else:
+                    args.append(document.cols[i])
+            else:
+                args.append(None)
+
+        selector = ', '.join(['?'] * len(args))
+        query = f'INSERT INTO {self._name} VALUES ({selector})'
+
+        ready = threading.Event()
+        def f():
+            cur = self._db.connection.cursor()
+            cur.execute(query, args)
+            self._db.connection.commit()
+
+            if self.primary:
+                if self.primary._field == '_id':
+                    id_ = cur.lastrowid
+                    document._id = id_
+
+            cur.close()
+            ready.set()
+
+        self._db._enqueue(f)
+        ready.wait()
+
+
+class DB:
+    def __init__(self, path):
+        self.tables = []
+
+        self.connection = None
+        threading.Thread(target=self._monitor, args=(path, ), daemon=True).start()
+
+        self._queue = []
+        self._queue_ready = threading.Event()
+        self._queue_lock = threading.Lock()
+    
+    def _enqueue(self, f):
+        with self._queue_lock:
+            self._queue.append(f)
+            self._queue_ready.set()
+
+    def _monitor(self, path):
+        self.connection = sqlite3.connect(path)
+
+        while True:
+            self._queue_ready.wait()
+            with self._queue_lock:
+                item = self._queue.pop(0)
+                if not self._queue:
+                    self._queue_ready.clear()
+
+            item()
+
+    def object(self, obj_class):
+        attributes = obj_class.__annotations__
+        obj_class._fields = []
+        table = Table(self, obj_class.__name__)
+
+        for i in attributes:
+            if attributes[i] not in ALLOWED_TYPES and not isinstance(attributes[i], (Table, Reference, Wrapper)):
+                raise ValueError('Unsupported type:', attributes[i])
+
+            original = [attributes[i]]
+            while isinstance(attributes[i], Wrapper):
+                if attributes[i].wraps not in ALLOWED_TYPES and not isinstance(attributes[i].wraps, (Table, Reference)):
+                    raise ValueError('Unsupported type:', attributes[i].wraps)
+                attributes[i] = attributes[i].wraps
+                original.append(attributes[i])
+
+            if isinstance(original[0], List):
+                if isinstance(attributes[i], Table):
+                    r_table = attributes[i]
+                else:
+                    r_table = attributes[i].get_table()
+
+                new_t = Table(self, f'___{table}__{r_table}')
+                new_t.fields.append(
+                    Reference(self, new_t, str(table), int)
+                )
+                new_t.fields.append(
+                    Reference(self, new_t, str(r_table), r_table.primary)
+                )
+                self.tables.append(new_t)
+                new_t.magic = [str(table), str(r_table), new_t]
+                table.magic = [str(table), str(r_table), new_t]
+
+                ref = Reference(self, table, i, Reference(self, new_t, str(table), int), [list])
+            else:
+                ref = Reference(self, table, i, attributes[i], original)
+
+            table.fields.append(ref)
+            setattr(table, i, ref)
+
+            if isinstance(original[0], Primary):
+                if table.primary is not None:
+                    raise ValueError('Table cannot have multiple primary keys!')
+                table.primary = ref
+
+        if table.primary is None:
+            ref = Reference(self, table, '_id', int, [Auto[Primary[int]], Primary[int], int])
+            table.fields.insert(0, ref)
+            table._id = ref
+            table.primary = ref
+
+        self.tables.append(table)
+
+        return table
+
+    def prepare(self, exist_ok=False):
+        ready = threading.Event()
+        def f():
+            cur = self.connection.cursor()
+            for i in self.tables:
+                cur.execute(i.prepare(exist_ok))
+            cur.close()
+
+            ready.set()
+        self._enqueue(f)
+        ready.wait()
+
+\end{pythoncode}
+\subsection{voiplib.database.test}
+\begin{pythoncode}
+from orm import DB, Primary, NotNull, List
+
+db = DB(':memory:')
+
+
+@db.object
+class TestObject1:
+    name: Primary[str]
+    age: NotNull[int]
+
+
+@db.object
+class TestObject2:
+    help_me: float
+    to1: TestObject1
+
+
+@db.object
+class TestObject3:
+    to2: TestObject2.to1
+
+
+@db.object
+class TestObject4:
+    objects: List[TestObject3]
+
+
+db.prepare()
+
+obj = TestObject1('name', 5)
+
+print(TestObject1.select(name='name'))
+TestObject1.insert(obj)
+obj.name = 'test'
+TestObject1.insert(obj)
+print(TestObject1.select())
+print(TestObject1.select(name='name'))
+
+ob2 = TestObject2(0.5, obj)
+ob3 = TestObject3(ob2)
+
+ob4 = TestObject4([])
+TestObject2.insert(ob2)
+TestObject4.insert(ob4)
+ob4.objects.append(ob3)
+
+print(TestObject2.select())
+
+print(ob4)
+
+print(ob4.objects)
+\end{pythoncode}
+\subsection{voiplib.database.\_\_init\_\_}
+\begin{pythoncode}
+from .orm import DB, Primary
+
+
+db = DB(':memory:')
+
+
+@db.object
+class GateConfig:
+    attack: float
+    hold: float
+    release: float
+    threshold: float
+
+
+@db.object
+class CompConfig:
+    attack: float
+    release: float
+    threshold: float
+
+
+@db.object
+class Devices:
+    deviceID: Primary[str]
+    MAC: str
+    lastIp: str
+    name: str
+    prioritySpeaker: bool
+    gate: GateConfig
+    comp: CompConfig
+
+
+@db.object
+class Histories:
+    device: Devices
+    timestamp: int
+    event: int
+    details: str
+
+
+db.prepare()
+\end{pythoncode}
+\subsection{voiplib.history}
+\begin{pythoncode}
+import time
+
+from .database import Histories
+
+
+EVENT_CONN = 0
+EVENT_DCON = 1
+EVENT_TEXT = 2
+
+
+def insert(device, event, details=''):
+    history = Histories(device, int(time.time() * 1000), event, details)
+    Histories.insert(history)
+
+
+def find(device):
+    return Histories.select(device=device)
+\end{pythoncode}
+\subsection{voiplib.interface.main}
+\begin{pythoncode}
+import threading
+import struct
+import math
+import sys
+
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+
+from ..audio import AudioIO
+from ..audio_processors.base import AudioProcessor
+from ..config import *
+from ..opcodes import *
+from ..socket_controller import SocketController, SocketMode, KeyManager
+
+CLEAR_SCROLL = """
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollArea > QWidget > QScrollBar { background: palette(base); }
+"""
+
+ROUND_BUTTON = """
+QPushButton {
+    border: 2px solid #8f8f91;
+    border-radius: 60px;
+    min-width: 120px;
+    max-width: 120px;
+    min-height: 120px;
+    max-height: 120px;
+    background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                      stop: 0 #f6f7fa, stop: 1 #dadbde);
+}
+
+QPushButton:pressed {
+    background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                      stop: 0 #dadbde, stop: 1 #f6f7fa);
+}
+
+QPushButton:flat {
+    border: none; /* no border for a flat push button */
+}
+
+QPushButton:default {
+    border-color: navy; /* make the default button prominent */
+}
+"""
+
+POW_2 = math.pow(2, (5 / 6)) / 2
+
+
+def db_to_thresh(db):
+    # 24576 is a magic number from ((1 << 14) + (1 << 15)) / 2
+    return 24576 * math.pow(POW_2, -db)
+
+
+def thresh_to_db(thresh):
+    if thresh == 0:
+        return -68
+    return (6 * math.log(abs(thresh))) / math.log(2) - 80
+
+
+class Communicate(QObject):
+    reload_rooms = pyqtSignal()
+
+
+class SocketManager:
+    km = KeyManager()
+    sock = SocketController()
+
+    client_sock = SocketController(km=km)
+    udp_send = SocketController(SocketMode.UDP, km=km)
+    udp_recv = SocketController(SocketMode.UDP, km=km)
+
+    clients = {}
+    rooms = []
+    client_id = b''
+
+    aio = AudioIO()
+    amps = {}
+
+    class AudioReturn(AudioProcessor):
+        def __init__(self, amps):
+            self.amps = amps
+
+        def process(self, data, packet, amp):
+            self.amps[packet.client_id] = amp
+            return None
+
+        def clone(self):
+            return self.__class__(self.amps)
+
+    signals = Communicate()
+
+    @classmethod
+    def mainloop(cls):
+        while True:
+            pkt = cls.udp_recv.get_packet(True)
+
+            if pkt[2].opcode == AUDIO:
+                try:
+                    cls.aio.feed(pkt[2].payload, pkt[2])
+                except:
+                    pass
+
+    @classmethod
+    def tcp_mainloop(cls):
+        while True:
+            pkt = cls.sock.get_packet(True)
+
+            try:
+                if pkt[2].opcode == CLIENT_JOIN:
+                    if pkt[2].payload[:16] == cls.client_id:
+                        continue
+
+                    n_rooms = pkt[2].payload[30]
+                    r_data = pkt[2].payload[31:31 + n_rooms]
+                    payload_rest = pkt[2].payload[31 + n_rooms:]
+                    name_l = payload_rest[0]
+                    name = payload_rest[1:1 + name_l].decode('latin-1')
+
+                    cls.clients[pkt[2].payload[:16]] = [
+                        list(struct.unpack('!4H', pkt[2].payload[16:24])),
+                        list(struct.unpack('!3H', pkt[2].payload[24:30])),
+                        name
+                    ]
+                    for i in r_data:
+                        while i >= len(cls.rooms):
+                            cls.rooms.append([])
+                        cls.rooms[i].append(pkt[2].payload[:16])
+
+                    cls.signals.reload_rooms.emit()
+                elif pkt[2].opcode == GET_RECORD:
+                    cls.on_get_record(pkt[2].payload)
+            except:
+                import traceback
+                traceback.print_exc()
+            
+    @staticmethod
+    def on_get_record(payload):
+        pass
+
+    @classmethod
+    def setup(cls):
+        cls.sock.connect(SERVER, CONTROL_PORT)
+        cls.sock.start()
+        cls.sock.use_special_encryption = True
+        client_id = cls.sock.do_tcp_client_auth()
+
+        cls.client_sock.connect(SERVER, TCP_PORT)
+        cls.client_sock.use_special_encryption = True
+        cls.client_sock.start()
+
+        cls.client_id = cls.client_sock.do_tcp_client_auth()
+        cls.udp_send.client_id = cls.client_id
+        cls.udp_recv.client_id = cls.client_id
+
+        cls.udp_send.connect(SERVER, TCP_PORT)
+
+        cls.udp_recv.bind('', 0)
+        cls.udp_port = cls.udp_recv.getsockname()[1]
+        cls.udp_recv.start()
+
+        reg_udp = struct.pack('!H', cls.udp_port)
+        cls.client_sock.send_packet(REGISTER_UDP, reg_udp)
+        cls.sock.send_packet(REGISTER_UDP, reg_udp)
+
+        cls.aio.back_pipeline.append(cls.AudioReturn(cls.amps))
+        cls.aio.begin()
+
+        threading.Thread(target=cls.mainloop, daemon=True).start()
+        threading.Thread(target=cls.tcp_mainloop, daemon=True).start()
+
+
+class HBox(QWidget):
+    def __init__(self, parent, align=None):
+        super().__init__(parent)
+        self._layout = QHBoxLayout(self)
+        self.setLayout(self._layout)
+
+        if align:
+            self._layout.setAlignment(align)
+
+    def count(self):
+        return self._layout.count()
+
+    def itemAt(self, x):
+        return self._layout.itemAt(x)
+
+    def addWidget(self, child):
+        self._layout.addWidget(child)
+
+    def setContentsMargins(self, *args):
+        self._layout.setContentsMargins(*args)
+
+
+class VBox(QWidget):
+    def __init__(self, parent, align=None):
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self.setLayout(self._layout)
+
+        if align:
+            self._layout.setAlignment(align)
+
+    def addWidget(self, child):
+        self._layout.addWidget(child)
+
+    def setContentsMargins(self, *args):
+        self._layout.setContentsMargins(*args)
+
+
+class Spoiler(QWidget):
+    def __init__(self, title, animation_duration, parent):
+        super().__init__(parent)
+        self.animationDuration = animation_duration
+
+        self.toggleButton = QToolButton()
+        self.toggleButton.setStyleSheet("QToolButton { border: none; }")
+        self.toggleButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggleButton.setArrowType(Qt.RightArrow)
+        self.toggleButton.setText(title)
+        self.toggleButton.setCheckable(False)
+        self.toggleButton.setChecked(False)
+
+        self._open = False
+
+        header_line = QFrame()
+        header_line.setFrameShape(QFrame.HLine)
+        header_line.setFrameShadow(QFrame.Sunken)
+        header_line.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+        self.contentArea = QScrollArea()
+        self.contentArea.setStyleSheet(CLEAR_SCROLL)
+        self.contentArea.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # Start out collapsed
+        self.contentArea.setMaximumHeight(0)
+        self.contentArea.setMinimumHeight(0)
+        # Let the entire widget grow and shrink with its content
+        self.toggleAnimation = QParallelAnimationGroup()
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self.contentArea, b"maximumHeight"))
+        # Don't waste space
+        main_layout = QGridLayout()
+        main_layout.setVerticalSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        row = 0
+        main_layout.addWidget(self.toggleButton, row, 0, 1, 1, Qt.AlignLeft)
+        main_layout.addWidget(header_line, row, 2, 1, 1)
+        row += 1
+        main_layout.addWidget(self.contentArea, row, 0, 1, 3)
+
+        self.setLayout(main_layout)
+        self.setLayout(main_layout)
+        self.toggleButton.clicked.connect(self.on_click)
+
+    def open(self):
+        if not self._open:
+            self.on_click()
+
+    def close(self):
+        if self._open:
+            self.on_click()
+
+    def on_click(self):
+        self._open = not self._open
+        checked = self._open
+
+        self.toggleButton.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.toggleAnimation.setDirection(QAbstractAnimation.Forward if checked else QAbstractAnimation.Backward)
+        self.toggleAnimation.start()
+
+    def set_content_layout(self, content_layout):
+        self.contentArea.setLayout(content_layout)
+        self.reload_content_layout()
+
+    def reload_content_layout(self):
+        collapsed_height = self.sizeHint().height() - self.contentArea.maximumHeight()
+        content_height = self.contentArea.layout().sizeHint().height()
+
+        for i in range(self.toggleAnimation.animationCount() - 1):
+            spoiler_anim = self.toggleAnimation.animationAt(i)
+            spoiler_anim.setDuration(self.animationDuration)
+            spoiler_anim.setStartValue(collapsed_height)
+            spoiler_anim.setEndValue(collapsed_height + content_height)
+
+        content_anim = self.toggleAnimation.animationAt(self.toggleAnimation.animationCount() - 1)
+        content_anim.setDuration(self.animationDuration)
+        content_anim.setStartValue(0)
+        content_anim.setEndValue(content_height)
+
+
+class VBSpoiler(Spoiler):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+        self._layout = QVBoxLayout()
+
+        self.set_content_layout(self._layout)
+
+    def addWidget(self, widget):
+        self._layout.addWidget(widget)
+        self.reload_content_layout()
+
+
+class HBSpoiler(Spoiler):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+        self._layout = QHBoxLayout()
+
+        self.set_content_layout(self._layout)
+
+    def addWidget(self, widget):
+        self._layout.addWidget(widget)
+        self.reload_content_layout()
+
+
+class MetadataListModel(QAbstractListModel):
+    MetadataRole = Qt.UserRole
+
+    MaxRole = MetadataRole
+
+    def __init__(self, source=False):
+        super().__init__()
+        self.listdata = []
+        self.tooltips = []
+        self.metadata = []
+        self.data_changed = None
+
+        self.source = source
+
+        self.sort(0)
+    
+    def supportedDragActions(self):
+        return Qt.CopyAction if self.source else Qt.MoveAction
+
+    # Custom methods
+    def add_item(self, text, tooltip=None, metadata=None):
+        self.listdata.append(text)
+        self.tooltips.append(tooltip)
+        self.metadata.append(metadata)
+        self.sort(0)
+
+        self.dataChanged.emit(self.index(0, 0), self.index(0, len(self.listdata)))
+
+    def clear(self):
+        original = len(self.listdata)
+        self.listdata.clear()
+        self.tooltips.clear()
+        self.metadata.clear()
+
+        self.dataChanged.emit(self.index(0, 0), self.index(0, original))
+
+    # QAbstractListModel overrides
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.listdata)
+
+    def data(self, index, role=Qt.DisplayRole):
+        self.sort(0)
+
+        if index.isValid():
+            row = index.row()
+            if row >= len(self.listdata):
+                return None
+
+            if role == Qt.DisplayRole:
+                return self.listdata[index.row()]
+            if role == Qt.ToolTipRole:
+                return self.tooltips[index.row()]
+            if role == self.MetadataRole:
+                return self.metadata[index.row()]
+        return None
+
+    def removeRows(self, row, count, parent):
+        self.beginRemoveRows(parent, row, row + count - 1)
+        self.listdata = self.listdata[:row] + self.listdata[row + count:]
+        self.tooltips = self.tooltips[:row] + self.tooltips[row + count:]
+        self.metadata = self.metadata[:row] + self.metadata[row + count:]
+        self.endRemoveRows()
+
+        if self.data_changed is not None:
+            self.data_changed()
+
+        return True
+
+    def flags(self, index):
+        if index.isValid():
+            return Qt.ItemIsSelectable | Qt.ItemIsDragEnabled | Qt.ItemIsEnabled
+        return Qt.ItemIsSelectable | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled | Qt.ItemIsEnabled
+
+    def supportedDropActions(self):
+        return Qt.CopyAction | Qt.MoveAction
+
+    def columnCount(self, parent):
+        return 0 if parent.isValid() else 1
+
+    def dropMimeData(self, data, action, row, column, parent):
+        encoded = data.data('application/x-qabstractitemmodeldatalist')
+        stream = QDataStream(encoded, QIODevice.ReadOnly)
+        return self.decodeData(row, column, parent, stream)
+
+    def setItemData(self, index, roles):
+        if Qt.DisplayRole in roles:
+            self.listdata[index.row()] = roles[Qt.DisplayRole]
+        if Qt.ToolTipRole in roles:
+            self.tooltips[index.row()] = roles[Qt.ToolTipRole]
+        if self.MetadataRole in roles:
+            self.metadata[index.row()] = roles[self.MetadataRole]
+
+        if self.data_changed is not None:
+            self.data_changed()
+
+        return True
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        if not self.listdata:
+            return
+
+        new_l = []
+        for i in zip(self.listdata, self.tooltips, self.metadata):
+            if i not in new_l:
+                new_l.append(i)
+
+        self.listdata, self.tooltips, self.metadata = zip(*sorted(new_l))
+        self.listdata = list(self.listdata)
+        self.tooltips = list(self.tooltips)
+        self.metadata = list(self.metadata)
+
+    def insertRows(self, row, count, parent):
+        self.beginInsertRows(parent, row, row + count - 1)
+
+        row = max(row, 0)
+        self.listdata = self.listdata[:row] + [None] * count + self.listdata[row:]
+        self.tooltips = self.tooltips[:row] + [None] * count + self.tooltips[row:]
+        self.metadata = self.metadata[:row] + [None] * count + self.metadata[row:]
+        self.endInsertRows()
+
+        if self.data_changed is not None:
+            self.data_changed()
+
+        return True
+
+    def itemData(self, index):
+        roles = {}
+        for i in range(self.MaxRole + 1):
+            variant_data = self.data(index, i)
+            if variant_data is not None:
+                roles[i] = variant_data
+        return roles
+
+
+class RoomsPane(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._parent = parent
+
+        self.layout = QVBoxLayout(self)
+        self.setLayout(self.layout)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet(CLEAR_SCROLL)
+
+        self.columns = HBox(self)
+        self.scroll.setWidget(self.columns)
+
+        self.cols = []
+        self.models = []
+        self.add_column('All Clients', 0)
+
+        self.layout.addWidget(self.scroll)
+
+        self.reload_rooms()
+        SocketManager.signals.reload_rooms.connect(self.reload_rooms)
+
+    def data_changed(self):
+        while len(SocketManager.rooms) < len(self.models) - 1:
+            SocketManager.rooms.append([])
+
+        for n, i in enumerate(SocketManager.rooms):
+            i.clear()
+            for j in self.models[n + 1].metadata:
+                if j:
+                    i.append(j['client_id'])
+
+        for client_id in SocketManager.clients:
+            rooms = bytearray([n for n, i in enumerate(SocketManager.rooms) if client_id in i])
+            rooms.insert(0, len(rooms))
+
+            payload = client_id + rooms
+            SocketManager.sock.send_packet(SET_ROOMS, payload)
+
+    def reload_rooms(self):
+        while len(SocketManager.rooms) + 1 >= len(self.cols):
+            self.add_column(f'Room #{len(self.cols)}', len(self.cols))
+
+        for model in self.models:
+            model.clear()
+
+        for n, c in enumerate(SocketManager.clients):
+            name = SocketManager.clients[c][2] or 'NO NAME'
+            ip = f'192.168.0.{n + 1}'
+            mac = '00:11:22:33:44:55:66'
+
+            for m, i in enumerate(self.models):
+                if m == 0 or (m <= len(SocketManager.rooms) and c in SocketManager.rooms[m - 1]):
+                    self.models[m].add_item(name, f'Name: {name}\nIP: {ip}\nMAC: {mac}', metadata={
+                        'client_id': c
+                    })
+
+    def add_column(self, name, n, width=250):
+        while n >= len(self.cols):
+            self.cols.append(None)
+            self.models.append(None)
+
+        self.cols[n] = VBox(self.columns)
+        self.cols[n].setContentsMargins(0, 0, 0, 0)
+        heading = QLabel(name, self.cols[n])
+        heading.setFixedWidth(width)
+        self.cols[n].addWidget(heading)
+
+        view = QListView()
+        self.models[n] = MetadataListModel(n == 0)
+        self.models[n].data_changed = self.data_changed
+        view.setModel(self.models[n])
+        view.setDragDropMode(QAbstractItemView.DragDrop)
+        view.setDefaultDropAction(Qt.MoveAction)
+
+        view.doubleClicked.connect(self.open_client(self.models[n]))
+        self.cols[n].addWidget(view)
+
+        self.columns.addWidget(self.cols[n])
+
+    def open_client(self, model):
+        def _open_client(index):
+            data = model.data(index, model.MetadataRole)
+
+            cw = self._parent.client_window
+
+            cw.gate_chart.cutoff = thresh_to_db(SocketManager.clients[data['client_id']][0][3])
+            cw.gate_slider.setValue(thresh_to_db(SocketManager.clients[data['client_id']][0][3]))
+            cw.comp_chart.cutoff = thresh_to_db(SocketManager.clients[data['client_id']][1][2])
+            cw.comp_slider.setValue(thresh_to_db(SocketManager.clients[data['client_id']][1][2]))
+
+            cw.client_name.setText(SocketManager.clients[data['client_id']][2])
+
+            cw.gate_chart.repaint()
+            cw.comp_chart.repaint()
+
+            cw.target_client_id = data['client_id']
+            cw.show()
+
+        return _open_client
+
+
+class AudioChart(QWidget):
+    BACKGROUND = QBrush(QColor(225, 250, 136))
+    GRID_LINE1 = QColor(177, 198, 106)
+    GRID_LINE2 = QColor(168, 190, 99)
+    ZERO_LINE = QColor(82, 93, 48)
+    TEXT_COLOR = QColor(82, 93, 48)
+    DIAG_LINE = QColor(171, 196, 84)
+
+    MAIN_LINE_C = QColor(89, 102, 51)
+    MAIN_LINE = QPen(MAIN_LINE_C, 2)
+
+    def __init__(self, parent, width=400, height=400):
+        super().__init__(parent)
+        self._size = (width, height)
+
+        self.enabled = True
+        self.blob = -12
+
+        self.setFixedWidth(width)
+        self.setFixedHeight(height)
+
+    def paintEvent(self, event):
+        qp = QPainter()
+        qp.begin(self)
+
+        qp.fillRect(0, 0, *self._size, self.BACKGROUND)
+        cell_w = (self._size[0] - 1) / 16
+        cell_h = (self._size[0] - 1) / 16
+
+        # y = x
+        qp.setPen(self.DIAG_LINE)
+        qp.drawLine(-1, self._size[1], self._size[0], -1)
+
+        # Minor lines
+        qp.setPen(self.GRID_LINE1)
+        for i in range(0, 18, 2):
+            qp.drawLine(0, i * cell_h, self._size[0], i * cell_h)
+            qp.drawLine(i * cell_w, 0, i * cell_w, self._size[1])
+        # Major lines
+        qp.setPen(self.GRID_LINE2)
+        for i in range(1, 18, 2):
+            qp.drawLine(0, i * cell_h, self._size[0], i * cell_h)
+            qp.drawLine(i * cell_w, 0, i * cell_w, self._size[1])
+        # Zero line
+        qp.setPen(self.ZERO_LINE)
+        qp.drawLine(0, 5 * cell_h, self._size[0], 5 * cell_h)
+        qp.drawLine(11 * cell_w, 0, 11 * cell_w, self._size[1])
+
+        # dB markers
+        qp.setPen(self.TEXT_COLOR)
+        qp.setFont(QFont('Decorative', 10))
+        for i in range(1, 18, 2):
+            rect = QRect(0, (i - 0.5) * cell_h, self._size[0] - 4, cell_h)
+            qp.drawText(rect, Qt.AlignRight | Qt.AlignVCenter, f'{(16 - i) * 6 - 66} dB')
+
+        for i in range(3, 18, 4):
+            rect = QRect((i - 1) * cell_w, self._size[1] - 50, cell_w * 2, 50)
+            qp.drawText(rect, Qt.AlignHCenter | Qt.AlignBottom, f'{i * 6 - 66}')
+
+        qp.setPen(self.MAIN_LINE)
+        qp.setBrush(QBrush(self.MAIN_LINE_C, Qt.SolidPattern))
+        b_x, b_y = self.getBlob()
+
+        qp.setRenderHint(QPainter.Antialiasing)
+        qp.drawEllipse(b_x - 4, b_y - 4, 8, 8)
+        self.drawMain(qp)
+
+        if not self.enabled:
+            qp.fillRect(QRect(0, 0, *self._size), QBrush(QColor(240, 240, 240, 90)))
+
+        qp.end()
+
+    def getBlob(self):
+        b_y = self._size[1] - (self._size[0] / 96) * (self.blob + 66)
+        b_x = self._size[1] - b_y
+        return b_x, b_y
+
+    def drawMain(self, qp):
+        pass
+
+
+class GateChart(AudioChart):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.cutoff = -36
+
+    def drawMain(self, qp):
+        qp.setRenderHint(QPainter.Antialiasing)
+        qp.setPen(self.MAIN_LINE)
+
+        co_x = (self._size[0] / 96) * (self.cutoff + 66)
+        co_y = self._size[1] - co_x
+
+        qp.drawLine(co_x, co_y, self._size[0], -1)
+        qp.drawLine(co_x, co_y + 1, co_x, self._size[1])
+
+    def getBlob(self):
+        x, y = super().getBlob()
+        if self.blob > self.cutoff or not self.enabled:
+            return x, y
+        else:
+            return x, self._size[1]
+
+
+class CompChart(AudioChart):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.cutoff = -36
+
+    def drawMain(self, qp):
+        qp.setRenderHint(QPainter.Antialiasing)
+        qp.setPen(self.MAIN_LINE)
+
+        co_x = (self._size[0] / 96) * (self.cutoff + 66)
+        co_y = self._size[1] - co_x
+
+        qp.drawLine(co_x + 1, co_y, self._size[0], co_y)
+        qp.drawLine(co_x, co_y, -1, self._size[1])
+
+    def getBlob(self):
+        x, y = super().getBlob()
+        if self.blob < self.cutoff or not self.enabled:
+            return x, y
+        else:
+            co_y = self._size[1] - (self._size[0] / 96) * (self.cutoff + 66)
+
+            return x, co_y
+
+
+class ClientWindow(QMainWindow):
+    def __init__(self, parent, rec):
+        super().__init__(parent)
+        self.target_client_id = None
+        self.rec = rec
+
+        self.layout = VBox(self)
+        self.setCentralWidget(self.layout)
+        self.setWindowTitle('Client Management')
+        self.resize(1200, 600)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.rows = VBox(self, Qt.AlignTop)
+        self.scroll.setWidget(self.rows)
+        self.scroll.setStyleSheet(CLEAR_SCROLL)
+
+        self.setup_sp = VBSpoiler('Client Setup', 100, self.rows)
+        self.audio_sp = HBSpoiler('Audio Setup', 100, self.rows)
+        self.opus_sp = VBSpoiler('OPUS', 100, self.rows)
+
+        # Client setup
+        self.client_name = QLineEdit(self.setup_sp, placeholderText='Display Name')
+        self.o_rec = QPushButton("Open Recorder", self.setup_sp, )
+        self.o_rec.clicked.connect(self.open_rec)
+        self.setup_sp.addWidget(self.client_name)
+        self.setup_sp.addWidget(self.o_rec)
+        self.client_name.textChanged.connect(self.name_changed)
+
+        # Gate setup
+        gate_vb = VBox(self.audio_sp)
+        hb = HBox(gate_vb, Qt.AlignLeft)
+        self.gate_chart = GateChart(hb)
+        hb.addWidget(self.gate_chart)
+
+        self.gate_slider = QSlider(hb, minimum=-66, maximum=30, singleStep=1, sliderPosition=-36)
+        hb.addWidget(self.gate_slider)
+        self.gate_slider.valueChanged.connect(self.gate_changed)
+
+        gate_vb.addWidget(hb)
+        self.audio_sp.addWidget(gate_vb)
+
+        # Compressor setup
+        comp_vb = VBox(self.audio_sp)
+        hb = HBox(comp_vb, Qt.AlignLeft)
+        self.comp_chart = CompChart(hb)
+        hb.addWidget(self.comp_chart)
+
+        self.comp_slider = QSlider(hb, minimum=-66, maximum=30, singleStep=1, sliderPosition=-12)
+        hb.addWidget(self.comp_slider)
+        self.comp_slider.valueChanged.connect(self.comp_changed)
+
+        comp_vb.addWidget(hb)
+        self.audio_sp.addWidget(comp_vb)
+        # OPUS setup
+
+        # Build spoilers
+        self.rows.addWidget(self.setup_sp)
+        self.rows.addWidget(self.audio_sp)
+        self.rows.addWidget(self.opus_sp)
+
+        self.setup_sp.open()
+        self.audio_sp.open()
+        self.layout.addWidget(self.scroll)
+
+        # Animation
+        self.t_client_id = None
+        self.u_timer = QTimer()
+        self.u_timer.timeout.connect(self.move_blobs)
+        self.u_timer.start(10)
+
+    def open_rec(self):
+        self.rec.target_client_id = self.target_client_id
+        self.rec.show()
+
+    def name_changed(self, new_name):
+        if self.target_client_id is None:
+            return
+        payload = self.target_client_id + new_name.encode('latin-1')
+        SocketManager.sock.send_packet(SET_NAME, payload)
+        SocketManager.clients[self.target_client_id][2] = new_name
+
+        SocketManager.signals.reload_rooms.emit()
+
+    def move_blobs(self):
+        if not SocketManager.amps:
+            return
+        if self.target_client_id is None:
+            return
+        amp = SocketManager.amps.get(self.target_client_id, 0)
+
+        try:
+            amp = thresh_to_db(amp)
+        except (ValueError, ZeroDivisionError):
+            return
+
+        self.gate_chart.blob = amp
+        self.comp_chart.blob = amp
+        self.gate_chart.repaint()
+        self.comp_chart.repaint()
+
+    def gate_changed(self):
+        if self.target_client_id is None:
+            return
+        db = self.gate_slider.sliderPosition()
+        threshold = db_to_thresh(db)
+        SocketManager.clients[self.target_client_id][0][3] = threshold
+
+        threshold = round(threshold)
+        payload = self.target_client_id + struct.pack('!4lH', -1, -1, -1, threshold, 6969)
+        SocketManager.sock.send_packet(SET_GATE, payload)
+
+        self.gate_chart.cutoff = db
+        self.gate_chart.repaint()
+
+    def comp_changed(self):
+        if self.target_client_id is None:
+            return
+        db = self.comp_slider.sliderPosition()
+        threshold = db_to_thresh(db)
+        SocketManager.clients[self.target_client_id][1][2] = threshold
+
+        threshold = round(threshold)
+        payload = self.target_client_id + struct.pack('!3lH', -1, -1, threshold, 6969)
+        SocketManager.sock.send_packet(SET_COMP, payload)
+
+        self.comp_chart.cutoff = db
+        self.comp_chart.repaint()
+
+    def closeEvent(self, event):
+        self.target_client_id = None
+
+
+class CircleButton(QPushButton):
+    RED = QColor(224, 73, 72)
+    BLUE = QColor(72, 95, 224)
+    GREEN = QColor(72, 224, 108)
+
+    REC = 0
+    STOP = 1
+    PAUSE = 2
+    PLAY = 3
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.setStyleSheet(ROUND_BUTTON)
+        self.state = self.PLAY
+    
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        qp = QPainter()
+        qp.begin(self)
+
+        if self.state == self.REC:
+            qp.setBrush(QBrush(self.RED, Qt.SolidPattern))
+            qp.setPen(Qt.NoPen)
+            qp.setRenderHint(QPainter.Antialiasing)
+            qp.drawEllipse(42, 42, 40, 40)
+        elif self.state == self.STOP:
+            qp.fillRect(42, 42, 40, 40, QBrush(self.BLUE))
+        elif self.state == self.PAUSE:
+            qp.fillRect(42, 42, 16, 40, QBrush(self.GREEN))
+            qp.fillRect(64, 42, 16, 40, QBrush(self.GREEN))
+        elif self.state == self.PLAY:
+            path = QPainterPath()
+            path.moveTo(44, 42)
+            path.lineTo(44, 82)
+            path.lineTo(82, 62)
+            path.lineTo(44, 42)
+            qp.fillPath(path, QBrush(self.GREEN))
+
+        qp.end()
+
+
+class RecorderWindow(QMainWindow):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.target_client_id = None
+
+        self.layout = VBox(self)
+        self.setCentralWidget(self.layout)
+        self.setWindowTitle('Recorder')
+        self.setWindowFlags(Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint)
+        self.resize(500, 200)
+
+        self.rows = VBox(self, Qt.AlignTop)
+
+        buttons = HBox(self)
+        self.buttons = [
+            CircleButton(buttons),
+            CircleButton(buttons),
+            CircleButton(buttons)
+        ]
+        for i in self.buttons:
+            buttons.addWidget(i)
+        self.buttons[0].state = CircleButton.REC
+        self.buttons[1].state = CircleButton.STOP
+        self.buttons[2].state = CircleButton.PLAY
+        self.buttons[0].clicked.connect(self.start_rec)
+        self.buttons[1].clicked.connect(self.stop_rec)
+        self.rows.addWidget(buttons)
+
+        self.status = QLabel("Not recording", self.rows)
+        self.rows.addWidget(self.status)
+
+        self.layout.addWidget(self.rows)
+
+        def on_get_record(payload):
+            self.status.setText(payload.decode('latin-1'))
+        SocketManager.on_get_record = on_get_record
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(50)
+
+    def start_rec(self):
+        SocketManager.sock.send_packet(START_RECORD, self.target_client_id)
+        self.tick()
+
+    def stop_rec(self):
+        SocketManager.sock.send_packet(STOP_RECORD, self.target_client_id)
+        self.tick()
+
+    def tick(self):
+        if not self.target_client_id:
+            return
+        SocketManager.sock.send_packet(GET_RECORD, self.target_client_id)
+
+    def closeEvent(self, event):
+        self.target_client_id = None
+
+
+class Window(QMainWindow):
+    def __init__(self, app):
+        super().__init__()
+
+        self.rec = RecorderWindow(self)
+
+        SocketManager.setup()
+
+        self.app = app
+        self.setWindowTitle('VoIP Management')
+
+        self.build_menubar()
+
+        self.rooms_pane = RoomsPane(self)
+        self.client_window = ClientWindow(self, self.rec)
+
+        self.tabs = QTabWidget(self)
+        self.tabs.addTab(self.rooms_pane, 'Rooming')
+        # self.tabs.addTab(self.client\_pane, 'Client Setup')
+        self.tabs.addTab(QWidget(), 'Server Setup')
+
+        self.resize(1300, 700)
+
+        self.setCentralWidget(self.tabs)
+
+    def quit(self):
+        choice = QMessageBox.question(self, 'Quit', 'Are you sure you want to quit?',
+                                      QMessageBox.Yes | QMessageBox.No)
+        if choice == QMessageBox.Yes:
+            self.app.quit()
+
+    def build_menubar(self):
+        menu = self.menuBar()
+
+        quit_action = QAction('&Quit', self)
+        quit_action.setShortcut('Ctrl+Q')
+        quit_action.triggered.connect(self.quit)
+
+        self.statusBar()
+        file_ = menu.addMenu('&File')
+        file_.addAction(quit_action)
+
+
+def main():
+    application = QApplication(sys.argv)
+
+    win = Window(application)
+    win.show()
+
+    sys.exit(application.exec_())
+\end{pythoncode}
+\subsection{voiplib.key\_manager}
+\begin{pythoncode}
+import hashlib
+from typing import Tuple, Optional, TypeVar
+from socket import socket
+
+from Crypto.Cipher import AES
+
+from .database import Devices
+
+
+AESt = TypeVar('AES')
+
+
+class KeyManager:
+    def __init__(self) -> None:
+        self.registered = {}
+        self._socks = {}
+
+    @staticmethod
+    def generate_client_id(key: bytes, address: Tuple[str, int]) -> bytes:
+        """
+        Generate or retreive the client id to assign or that was previously
+        assigned for a given client. The key is used in the absense of an
+        existing client id in order to generate the new id to issue.
+
+        :param bytes key: The key to use when generating a new io
+        :param typle address: The address of the connecting client
+        """
+        # Check the database for a previously assigned id
+        dev = Devices.select(lastIp=address[0])
+        # TODO: Make this use pubkeys
+        if False or dev:
+            return dev[0].deviceID
+        
+        # Converts any form of key into 16 bytes
+        return hashlib.md5(key).digest()
+
+    def get_aes(self, client_id: bytes) -> Optional[Tuple[AESt, AESt]]:
+        """
+        Return the pair of encoder and decoder required to perform the AES
+        encryption for any given client, identified by their client id.
+
+        :param bytes client_id: The client id to lookup
+        """
+        # Search for the requested client
+        r = self.registered.get(client_id)
+        if r is None:
+            return None
+        # Flatten the located metadata
+        _, __, key, iv = r
+        a = AES.new(key, AES.MODE_CBC, iv)
+        # As in, both the decoder and encoder are currently able to function
+        # off a single instance of the AES function. In some cases this is not
+        # possible, and as such this function returns both an object to be used
+        # for encoding, and a second to be used for decoding.
+        # In this implementation, the same object is returned twice. This is by
+        # design.
+        return a, a
+
+    def register(self, client_id: bytes, aes1: AES, aes2: AES, key: bytes,
+                 iv: bytes, sock: socket) -> None:
+        """
+        Register a new client to the key manager.
+
+        :param bytes client_id: The id of the new client
+        :param AES aes1: The primary AES instance
+        :param AES aes2: The secondary AES instance
+        :param bytes key: The key used to create further AES instances
+        :param bytes iv: The initialisation vector for the AES algorithm
+        :param socket sock: The socket this client is utilising currently
+        """
+        self.registered[client_id] = (aes1, aes2, key, iv)
+        self._socks[client_id] = sock
+
+    def sock_from_id(self, client_id: bytes) -> Optional[socket]:
+        """
+        Locate the socket required to transmit data to a given client
+
+        :param bytes client_id: The client to lookup
+        """
+        return self._socks.get(client_id)
+
+    def id_from_sock(self, sock: socket) -> Optional[bytes]:
+        """
+        Attempt to locate the client id for a given socket.
+        This is functionally the inverse of :func:`register`.
+
+        :param socket sock: The socket to lookup
+        """
+        for i in self._socks:
+            if self._socks[i] == sock:
+                return i
+
+        # No matching clients could be found
+        return None
+
+    def forget(self, client_id: bytes) -> None:
+        """
+        Expunge a client from the local tracking state.
+
+        :param bytes client_id: The client to remove
+        """
+        # Make sure to not remove something that doesn't exist
+        if client_id in self._socks:
+            del self._socks[client_id]
+        if client_id in self.registered:
+            del self.registered[client_id]
+\end{pythoncode}
+\subsection{voiplib.loggers.const}
+\begin{pythoncode}
+DEBUG = (0, 'DEBUG')
+INFO = (1, 'INFO')
+WARNING = (2, 'WARNING')
+ERROR = (3, 'ERROR')
+CRITICAL = (4, 'CRITICAL')
+
+LOG_DIR = './logs'
+\end{pythoncode}
+\subsection{voiplib.loggers.file\_output}
+\begin{pythoncode}
+from datetime import datetime
+import os
+
+
+class FileOutput:
+    def __init__(self, name: str) -> None:
+        # Parse the given filename
+        self.path = os.path.abspath(name)
+        dirname = os.path.dirname(self.path)
+
+        # Make sure we are able to create the file
+        os.makedirs(dirname, exist_ok=True)
+
+        # Add a log header for clarity
+        with open(self.path, 'a') as f:
+            f.write('\n')
+            f.write('  **** LOGS START AT {} ****\n'.format(datetime.now()))
+            f.write('\n')
+
+    def write(self, msg: str) -> None:
+        """
+        Write a string to the output file
+
+        :param str msg: The message to write
+        """
+        with open(self.path, 'a') as f:
+            f.write(msg)
+\end{pythoncode}
+\subsection{voiplib.loggers.logger}
+\begin{pythoncode}
+from datetime import datetime
+from typing import Tuple
+import inspect
+import sys
+
+from .const import INFO
+
+
+class Logger:
+    FORMAT = '[{level}] [{name}:{lineno}] {message}'
+    LEVEL = INFO
+
+    def __init__(self) -> None:
+        self.outputs = [sys.stderr]
+
+    def log(self, msg: str, level: Tuple[int, str], name: str) -> None:
+        """
+        Write an entry to the designated logging outputs.
+
+        :param str msg: The message to log
+        :param tuple level: The logging level
+        :param str name: The name of the logger performing the log
+        """
+        if level[0] < self.LEVEL[0]:
+            return
+        caller = inspect.stack()[3]
+
+        formatting = {
+            'level': level[1],
+            'name': name,
+            'message': msg,
+            'time': str(datetime.now()),
+
+            'lineno': caller.lineno,
+            'filename': caller.filename,
+            'function': caller.function,
+            'module': inspect.getmodule(caller.frame.f_code).__name__,
+        }
+        msg = self.FORMAT.format(**formatting)
+
+        self._log(msg + '\n')
+
+    def _log(self, msg: str) -> None:
+        """
+        Write a raw log message to all of the current outputs
+
+        :param str msg: The message to write
+        """
+        for i in self.outputs:
+            i.write(msg)
+\end{pythoncode}
+\subsection{voiplib.loggers.log\_module}
+\begin{pythoncode}
+from typing import Tuple
+
+from .logger import Logger
+from .const import *
+
+
+class LogModule:
+    def __init__(self, logger: Logger, name: str) -> None:
+        self.logger = logger
+        self.name = name
+
+    def log(self, level: Tuple[int, str], msg: str) -> None:
+        """
+        Log a message to the logger
+
+        :param tuple level: The log level to use
+        :param str msg: The message to log
+        """
+        self.logger.log(msg, level, self.name)
+
+    def debug(self, msg: str) -> None:
+        """
+        Log a message with level "DEBUG"
+
+        :param str msg: The message to log
+        """
+        self.log(DEBUG, msg)
+
+    def info(self, msg: str) -> None:
+        """
+        Log a message with level "INFO"
+
+        :param str msg: The message to log
+        """
+        self.log(INFO, msg)
+
+    def warning(self, msg: str) -> None:
+        """
+        Log a message with level "WARNING"
+
+        :param str msg: The message to log
+        """
+        self.log(WARNING, msg)
+
+    def error(self, msg: str) -> None:
+        """
+        Log a message with level "ERROR"
+
+        :param str msg: The message to log
+        """
+        self.log(ERROR, msg)
+
+    def critical(self, msg: str) -> None:
+        """
+        Log a message with level "CRITICAL"
+
+        :param str msg: The message to log
+        """
+        self.log(CRITICAL, msg)
+\end{pythoncode}
+\subsection{voiplib.loggers.\_\_init\_\_}
+\begin{pythoncode}
+import os
+
+from .file_output import FileOutput
+from .log_module import LogModule
+from .logger import Logger
+from .const import *
+
+
+# Create a modul-global logging handler
+loggerInst = Logger()
+
+
+def getLogger(name: str) -> LogModule:
+    """
+    Create a new named logger instance
+
+    :param str name: The name to associate with the logger
+    """
+    return LogModule(loggerInst, name)
+
+
+def createFileLogger(name: str) -> None:
+    """
+    Create and register a new file logging output.
+
+    :param str name: The name to use for the file. `.log` will be appended
+        and additional directories created as required.
+    """
+    name = os.path.join(LOG_DIR, name + '.log')
+    loggerInst.outputs.append(FileOutput(name))
+\end{pythoncode}
+\subsection{voiplib.muxer}
+\begin{pythoncode}
+import threading
+
+import numpy as np
+
+
+class Muxer:
+    """
+    Mix multiple streams of audio info a single output stream.
+    """
+    BUFFER = 1
+
+    def __init__(self) -> None:
+        """
+        Create a new muxer instance.
+        """
+        self._frames = {}
+        self._has_frame = threading.Event()
+
+    def write(self, frame: bytes, client: bytes) -> None:
+        """
+        Write a single frame into a muxer buffer.
+
+        :param bytes frame: The frame audio data
+        :param btyes client: The client id repsonsible for the audio
+        """
+        # Ensure we have a buffer for this client
+        if client not in self._frames:
+            self._frames[client] = []
+
+        # Very quickly decode the audio in the frame
+        frame = np.ndarray((len(frame) // 2,), '<h', frame)
+
+        # Buffer and flush the frame
+        self._frames[client].append(frame)
+        while len(self._frames[client]) > self.BUFFER:
+            self._frames[client].pop(0)
+        # Alert other threads that there is new data in the buffer
+        self._has_frame.set()
+
+    def read(self) -> bytes:
+        """
+        Read a single frame of audio from the mix.
+        """
+        for i in self._frames:
+            if len(self._frames[i]) > 0:
+                break
+        else:
+            self._has_frame.clear()
+            self._has_frame.wait()
+
+        frame = np.zeros((960,), dtype='<i')
+
+        for i in list(self._frames.keys()):
+            if not self._frames[i]:
+                continue
+            layer = self._frames[i].pop(0)
+            if layer.shape != frame.shape:
+                print('Shape error!')
+                continue
+            frame += layer
+            frame.clip(-1 << 15, (1 << 15) - 1)
+
+        return frame.astype('<h').tobytes('C')
+\end{pythoncode}
+\subsection{voiplib.opcodes}
+\begin{pythoncode}
+# Generic
+ACK = 0
+ABRT = 1
+
+# Handshaking
+HELLO = 2
+RSA_KEY = 3
+AES_KEY = 4
+AES_CHECK = 5
+
+# Main protocol
+AUDIO = 10
+REGISTER_UDP = 11
+
+# Control surface
+SET_GATE = 12
+SET_COMP = 13
+SET_ACK = 14
+SET_FAIL = 15
+CLIENT_JOIN = 16
+CLIENT_LEAVE = 17
+SET_NAME = 18
+SET_ROOMS = 19
+START_RECORD = 20
+STOP_RECORD = 21
+GET_RECORD = 22
+\end{pythoncode}
+\subsection{voiplib.recorder.recorder}
+\begin{pythoncode}
+import base64
+
+from ..util.opus import OpusDecoder
+from .. import loggers
+
+
+class Recorder:
+    FLUSH_EVERY = 10
+
+    def __init__(self) -> None:
+        self.recording = set()
+        self.rec_start = {}
+
+        self.recordings = {}
+        self._counts = {}
+        self._decoders = {}
+
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+    
+    def gen_filename(self, client_id: bytes) -> str:
+        """
+        Generate a filename for a given client id.
+        
+        :param bytes client_id: The client id being recorded
+        """
+        return './recording/' + base64.b64encode(client_id).strip(b'=').decode().replace('/', '_')
+
+    def feed(self, client_id: bytes, audio: bytes) -> None:
+        """
+        Feed a frame of audio into the recorder.
+
+        :param bytes client_id: The client id of the speaker
+        :param bytes audio: The frame of audio to record
+        """
+        # Check if we are actually recording them
+        if client_id not in self.recording:
+            return
+
+        # Setup initial recording state for new clients
+        if client_id not in self.recordings:
+            self.recordings[client_id] = Recording(
+                self.gen_filename(client_id))
+            self._decoders[client_id] = OpusDecoder()
+            self._counts[client_id] = 0
+        
+        # Decode the audio from Opus to PCM
+        audio = self._decoders[client_id].decode(audio[2:])
+        if audio is None:
+            self.log.warning('Failed to decode audio!')
+            return
+        # Forward the PCM to the recorder
+        self.recordings[client_id].write(audio)
+
+        # Increment the counter and check if we need to flush the byffers
+        self._counts[client_id] += 1
+        if self._counts[client_id] >= self.FLUSH_EVERY:
+            self.recordings[client_id].flush()
+            self.recordings[client_id].finish()
+            self._counts[client_id] = 0
+\end{pythoncode}
+\subsection{voiplib.recorder.recording}
+\begin{pythoncode}
+from io import BytesIO
+import threading
+import os
+
+from .wav_file import WAVFile
+
+
+class Recording:
+    def __init__(self, path: str) -> None:
+        # Parse the path and split it
+        path = os.path.abspath(os.path.expanduser(path))
+        self._dirname = os.path.dirname(path)
+        self._filename = os.path.basename(path)
+        os.makedirs(self._dirname, exist_ok=True)
+
+        # Create the in-memory PCM buffer
+        self._buffer = BytesIO()
+
+        # Temp file lock
+        self._temp_lock = threading.Lock()
+
+    @property
+    def path(self):
+        """
+        The path to be used for the final recording
+        """
+        return os.path.join(self._dirname, self._filename + '.wav')
+    
+    @property
+    def tmp_path(self) -> str:
+        """
+        The path to be used for the tempfile
+        """
+        return os.path.join(self._dirname, '~' + self._filename + '.pcm')
+    
+    def write(self, pcm: bytes) -> None:
+        """
+        Write a frame of PCM audio to the memory buffer
+        """
+        self._buffer.write(pcm)
+    
+    def flush(self) -> None:
+        """
+        Flush the PCM buffer from memory to disk
+        """
+        with self._temp_lock:
+            self._buffer.seek(0)
+            # Open the file for writing and flush the buffer
+            with open(self.tmp_path, 'ab') as file_:
+                file_.write(self._buffer.read())
+            # Truncate the buffer at the start to clear it
+            self._buffer.seek(0)
+            self._buffer.truncate()
+        
+    def finish(self) -> None:
+        """
+        Flush the PCM buffer from disk to the final output WAV file
+        """
+        with self._temp_lock:
+            if os.path.exists(self.tmp_path):
+                new = not os.path.exists(self.path)
+
+                # Open both files for reading and writing
+                with open(self.path, 'wb' if new else 'r+b') as wav_file:
+                    with open(self.tmp_path, 'rb') as pcm_file:
+                        # Write the wav file
+                        wav = WAVFile(wav_file, new=new)
+                        wav.write(pcm_file.read())
+
+                # Clean up the PCM buffer
+                os.remove(self.tmp_path)
+\end{pythoncode}
+\subsection{voiplib.recorder.wav\_file}
+\begin{pythoncode}
+from typing import BinaryIO
+from io import BytesIO
+import struct
+
+
+class WAVFile:
+    PCM = 1
+    Mono = 1
+    Stereo = 2
+
+    def __init__(self, file_obj: BinaryIO, rate: int=44100, channels: int=Mono,
+                 bps: int=16, new: bool=True) -> None:
+        self.file = file_obj
+        self.rate = rate
+        self.channels = channels
+        self.bps = bps
+        self.new = new
+    
+    def build_chunk(self, name: bytes, data: bytes) -> bytes:
+        """
+        Construct a RIFF chunk. This will build the header then append the
+        required data.
+
+        :param bytes name: The name of the chunk. Max 4 characters.
+        :param bytes data: The body data of the chunk
+        """
+        chunk = name.ljust(4, b' ')[:4]
+        chunk += struct.pack('<I', len(data))
+        return chunk + data
+    
+    def write(self, data: bytes) -> int:
+        """
+        Write a sequence of PCM data to a wav file
+
+        :param bytes data: The data to write/append to the file    
+        """
+        if self.new:
+            # The file didn't exist, so create a new header
+            fmt = struct.pack(
+                '<HHIIHH', self.PCM, self.channels,
+                self.rate, int(self.rate * self.channels * (self.bps / 8)),
+                int(self.channels * (self.bps / 8)), self.bps
+            )
+            # Setup the header header (yes, that's not a typo)
+            riff = b'WAVE'
+            riff += self.build_chunk(b'fmt', fmt)
+            riff += self.build_chunk(b'data', data)
+
+            # Write all the headers and data to the file
+            return self.file.write(self.build_chunk(b'RIFF', riff))
+        else:
+            # Jump to the 4th byte and read the file length
+            self.file.seek(4)
+            lbytes = self.file.read(4)
+            if len(lbytes) != 4:
+                # Failed to parse, overwrite the whole file
+                self.new = True
+                self.file.seek(0)
+                return self.write(data)
+            length = struct.unpack('<I', lbytes)[0]
+
+            # Write the new length
+            self.file.seek(4)
+            self.file.write(struct.pack('<I', length + len(data)))
+            # Read the length of the PCM data
+            self.file.seek(40)
+
+            dlb = self.file.read(4)
+            if len(dlb) != 4:
+                # Failed to parse, overwrite the whole file
+                self.new = True
+                self.file.seek(0)
+                return self.write(data)
+            dl = struct.unpack('<I', dlb)[0]
+
+            self.file.seek(40)
+            # Write the new length
+            self.file.write(struct.pack('<I', dl + len(data)))
+            # Seek to after existing data
+            self.file.seek(dl)
+            # Write the additional data to the file
+            self.file.write(data)
+            # Truncate the file at the current position to avoid trailing data
+            self.file.truncate()
+            return self.file.tell()    
+\end{pythoncode}
+\subsection{voiplib.recorder.\_\_init\_\_}
+\begin{pythoncode}
+from .recording import Recording
+from .recorder import Recorder
+from .wav_file import WAVFile
+\end{pythoncode}
+\subsection{voiplib.server}
+\begin{pythoncode}
+import threading
+import struct
+import time
+from socket import socket
+
+from .socket_controller import SocketController, SocketMode, KeyManager
+from .state_manager import StateManager
+from .recorder import Recorder
+from .opcodes import *
+from .config import *
+from . import loggers
+from . import history
+
+
+from .database.orm import DB, Primary
+from .database import Devices, GateConfig, CompConfig
+
+
+class Server:
+    def __init__(self) -> None:
+        """
+        Create a new server instance.
+        """
+        loggers.createFileLogger(__name__)
+
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+
+        # Create our local key manager
+        self.km = KeyManager()
+
+        # Create the 4 sockets the server will need to operate
+        self.sock = SocketController(km=self.km)
+        self.cont_sock = SocketController()
+        self.udp_recv = SocketController(SocketMode.UDP, km=self.km)
+        self.udp_send = SocketController(SocketMode.UDP, km=self.km)
+
+        # Setup a state manager and bind it to the sockets
+        self.sm = StateManager(self.sock, self.cont_sock, self.km)
+        # Setup a recorder
+        self.recorder = Recorder()
+
+        # Bind all the sockets to their respective hosts and ports
+        self.udp_recv.bind('', TCP_PORT)
+        self.udp_recv.start()
+
+        self.sock.bind(HOST, TCP_PORT)
+        self.sock.listen(10)
+
+        self.cont_sock.bind(HOST, CONTROL_PORT)
+        self.cont_sock.listen(10)
+        self.cont_udp_port = None
+
+        self.sock.start()
+        self.cont_sock.start()
+
+        self.udp_lock = threading.Lock()
+        self.udp_listeners = {}
+
+        # Bind event hooks to the controller
+        self.sock.tcp_lost_hook = self.tcp_lost
+        self.sock.new_tcp_hook = self.new_tcp
+
+    def tcp_lost(self, sock: socket, _) -> None:
+        """
+        A handler that is bound to a socket controller, called when a TCP
+        client disconnects. This function grabs the udp mutex, then clears out
+        any now-unneeded state for that client.
+        """
+        with self.udp_lock:
+            client_id = self.km.id_from_sock(sock)
+            if not client_id:
+                # Not sure who this socket was, ignore them.
+                return
+
+            if client_id in self.udp_listeners:
+                del self.udp_listeners[client_id]
+            self.km.forget(client_id)
+
+            # Log the event
+            target_device = Devices.select(deviceID=client_id.decode('latin-1'))
+            if target_device:
+                history.insert(target_device, history.EVENT_DCON)
+
+            # Inform the control surface a client has left.
+            self.cont_sock.send_packet(CLIENT_LEAVE, client_id)
+
+    def new_tcp(self, sock: socket, addr, client_id: bytes) -> None:
+        """
+        A hook bound to socket controllers, called when a client completes
+        their handshake. This function is responsible for saving and loading
+        data from the database to retain state between sessions.
+        """
+        # TODO: This!
+        #       This should be based off the pubkey.
+        target_device = Devices.select(deviceID=client_id.decode('latin-1'))
+
+        if not target_device:
+            self.log.debug('Device not found in database.')
+            # Create the audio config pair
+            gate = GateConfig(*self.sm.gates[client_id])
+            comp = CompConfig(*self.sm.compressors[client_id])
+            # Insert them so they get identifiers
+            GateConfig.insert(gate)
+            CompConfig.insert(comp)
+
+            # Create the core device config
+            target_device = Devices(
+                client_id.decode('latin-1'), "", addr[0],
+                self.sm.names[client_id],
+                False, gate, comp
+            )
+
+            # Register the device to the database
+            Devices.insert(target_device)
+        else:
+            self.log.debug('Restoring device config from database.')
+            # Restore all the configuation from the located device
+            dev = target_device[0]
+            self.sm.set_name(client_id, dev.name)
+
+            self.sm.set_gate(
+                client_id, (dev.gate.attack, dev.gate.hold,
+                            dev.gate.release, dev.gate.threshold)
+            )
+            self.sm.set_compressor(
+                client_id, (dev.gate.attack, dev.gate.release,
+                            dev.gate.threshold)
+            )
+        
+        # Log the event
+        history.insert(target_device, history.EVENT_CONN)
+        
+    def udp_mainloop(self):
+        """
+        The mainloop for UDP sections of the server. This handles mainly
+        routing of audio between mutliple clients.
+        """
+        while True:
+            pkt = self.udp_recv.get_packet(True)
+            self.log.debug(f'UDP packet from {pkt[1]}: {pkt[2].opcode}')
+            if pkt[2].opcode == AUDIO:
+                # Try feed the packet to the recorder. This may fail if there
+                # is a disk IO failure, or if the audio payload is malformed.
+                try:
+                    self.recorder.feed(pkt[2].client_id, pkt[2].payload)
+                except Exception as e:
+                    self.log.warning(f'Failed to record audio for {pkt[2].client_id}: {e}')
+
+                # Grab the UDP mutex for a short period
+                with self.udp_lock:
+                    listeners = dict(self.udp_listeners)
+                    # Locate all the clients in the same room
+                    can_listen = set(sum([i for i in self.sm.rooms
+                                          if pkt[2].client_id in i], []))
+                    # If a control surface is attached, forward the packet
+                    # there, too.
+                    if self.cont_udp_port is not None:
+                        can_listen.add(self.cont_udp_port)
+
+                    # Retransmit the audio to all clients allowed to listen.
+                    for i in can_listen:
+                        if pkt[2].client_id != i and i in listeners:
+                            self.udp_send.send_packet(
+                                AUDIO, pkt[2].payload, to=listeners[i],
+                                client_id=i, origin=pkt[2].client_id)
+
+    def cont_mainloop(self):
+        """
+        The mainloop responsible for interactions with the control surface.
+        """
+        while True:
+            pkt = self.cont_sock.get_packet(True)
+
+            self.log.debug(f'CONT packet from {pkt[1]}: {pkt[2].opcode}')
+            if pkt[2].opcode == SET_GATE:
+                try:
+                    # Decode the parameters from the payload
+                    client_id = pkt[2].payload[:16]
+                    attack, hold, release, threshold, nonce = (
+                        struct.unpack('!4lH', pkt[2].payload[16:])
+                    )
+                    attack = max(0, min(65535, attack))
+                    hold = max(0, min(65535, hold))
+                    release = max(0, min(65535, release))
+                    threshold = max(0, min(65535, threshold))
+
+                    # Locate the targeted client
+                    sock = self.km.sock_from_id(client_id)
+                    if sock is not None:
+                        # Inform the client of the change
+                        self.sock.send_packet(
+                            SET_GATE,
+                            pkt[2].payload[16:],
+                            to=sock,
+                            client_id=client_id
+                        )
+                        # Update the state manager
+                        self.sm.set_gate(
+                            client_id, (attack, hold, release, threshold)
+                        )
+                    # Inform the control surface of the success state
+                    self.cont_sock.send_packet(
+                        SET_FAIL if sock is None else SET_ACK,
+                        struct.pack('!H', nonce), to=pkt[0])
+                except struct.error:
+                    self.log.warning('Failed to decode CONT packet')
+            elif pkt[2].opcode == SET_COMP:
+                try:
+                    # Dedcode the parameters from the payload
+                    client_id = pkt[2].payload[:16]
+                    attack, release, threshold, nonce = (
+                        struct.unpack('!3lH', pkt[2].payload[16:])
+                    )
+                    attack = max(0, min(65535, attack))
+                    release = max(0, min(65535, release))
+                    threshold = max(0, min(65535, threshold))
+
+                    # Locate the targeted client
+                    sock = self.km.sock_from_id(client_id)
+                    if sock is not None:
+                        # Inform the client of the changes
+                        self.sock.send_packet(
+                            SET_COMP,
+                            pkt[2].payload[16:],
+                            to=sock,
+                            client_id=client_id
+                        )
+                        # Update the state manager
+                        self.sm.set_compressor(
+                            client_id,
+                            (attack, release, threshold)
+                        )
+                    # Inform the control surface of the success state
+                    self.cont_sock.send_packet(
+                        SET_FAIL if sock is None else SET_ACK,
+                        struct.pack('!H', nonce), to=pkt[0])
+                except struct.error:
+                    self.log.warning('Failed to decode CONT packet')
+            elif pkt[2].opcode == SET_NAME:
+                # Extract the name from the payload
+                client_id = pkt[2].payload[:16]
+                # Update the state manager
+                self.sm.set_name(
+                    client_id, pkt[2].payload[16:271].decode('latin-1')
+                )
+            elif pkt[2].opcode == SET_ROOMS:
+                # Decode the list from the payload
+                client_id = pkt[2].payload[:16]
+                room_n = pkt[2].payload[16]
+                rooms = pkt[2].payload[17: 17 + room_n]
+                # Update the state manager
+                self.sm.set_rooms(client_id, rooms)
+
+                # Log the event
+                target_device = Devices.select(deviceID=client_id.decode('latin-1'))
+                if target_device:
+                    history.insert(target_device, history.EVENT_TEXT, 'Moved rooms')
+            elif pkt[2].opcode == START_RECORD:
+                # Decode the payload
+                client_id = pkt[2].payload[:16]
+                self.recorder.recording.add(client_id)
+                self.recorder.rec_start[client_id] = time.time()
+
+                # Log the event
+                target_device = Devices.select(deviceID=client_id.decode('latin-1'))
+                if target_device:
+                    history.insert(target_device, history.EVENT_TEXT, 'Recording started')
+            elif pkt[2].opcode == STOP_RECORD:
+                # Decode the payload
+                client_id = pkt[2].payload[:16]
+                if client_id in self.recorder.recording:
+                    # Stop recording the client
+                    self.recorder.recording.remove(client_id)
+                    if client_id in self.recorder.recordings:
+                        # Write any remaining buffer to disk
+                        self.recorder.recordings[client_id].flush()
+                        self.recorder.recordings[client_id].finish()
+                        # Clean up after the recorder
+                        del self.recorder.recordings[client_id]
+                        del self.recorder._decoders[client_id]
+                        del self.recorder._counts[client_id]
+                
+                # Log the event
+                target_device = Devices.select(deviceID=client_id.decode('latin-1'))
+                if target_device:
+                    history.insert(target_device, history.EVENT_TEXT, 'Recording stopped')
+            elif pkt[2].opcode == GET_RECORD:
+                # Decode the payload
+                client_id = pkt[2].payload[:16]
+                if client_id not in self.recorder.recording:
+                    # Send a dummy message
+                    self.cont_sock.send_packet(GET_RECORD, b'Not recording', to=pkt[0])
+                else:
+                    # Convert seconds into a nicer format
+                    rec_len = time.time() - self.recorder.rec_start.get(client_id, time.time())
+                    ms = int(round(rec_len % 1, 3) * 1000)
+                    mi, se = divmod(int(rec_len), 60)
+                    hr, mi = divmod(mi, 60)
+                    dur = f'{hr:02}:{mi:02}:{se:02}.{ms:0<3}'.encode()
+                    # Respond to the client
+                    self.cont_sock.send_packet(GET_RECORD, b'Recording.. ' + dur, to=pkt[0])
+            elif pkt[2].opcode == REGISTER_UDP:
+                # Register the UDP recieve port for the control surface.
+                try:
+                    self.cont_udp_port = struct.unpack('!H', pkt[2].payload)[0]
+                except struct.error:
+                    self.log.warning(
+                        'Invalid packet when registering UDP port'
+                    )
+
+    def mainloop(self):
+        """
+        The mainloop for client TCP sockets. This is largely responsible for
+        register UDP connections, as encryption is handler by socket
+        controllers.
+        """
+        threading.Thread(target=self.udp_mainloop, daemon=True).start()
+        threading.Thread(target=self.cont_mainloop, daemon=True).start()
+
+        while True:
+            pkt = self.sock.get_packet(True)
+
+            self.log.debug(f'TCP packet from {pkt[1]}: {pkt[2].opcode}')
+            if pkt[2].opcode == REGISTER_UDP:
+                # Attempt to decode the packet
+                try:
+                    udp_port = struct.unpack('!H', pkt[2].payload)[0]
+
+                    self.udp_listeners[pkt[2].client_id] = (
+                        pkt[1][0],  # Source IP
+                        udp_port
+                    )
+                except struct.error:
+                    self.log.warning(
+                        'Invalid packet when registering UDP port'
+                    )
+
+
+if __name__ == '__main__':
+    Server().mainloop()
+\end{pythoncode}
+\subsection{voiplib.socket\_controller}
+\begin{pythoncode}
+import enum
+import threading
+import time
+from socket import (
+    socket, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR,
+)
+from typing import Union, Optional, Tuple, Callable
+
+from Crypto import Random
+from Crypto.Cipher import PKCS1_v1_5, AES
+from Crypto.Hash import SHA
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad, unpad
+
+from . import loggers
+from .key_manager import KeyManager
+from .opcodes import *
+from .util.packets import Packet, PacketError
+
+
+Address = Tuple[str, int]
+
+
+class SocketMode(enum.IntEnum):
+    TCP = 0
+    UDP = 1
+
+
+class HandshakeFailed(Exception):
+    """
+    Raised when a connected client initiates a handshake, then proceeds to fail
+    the handshake.
+    """
+    pass
+
+
+class SocketController:
+    # The maximum size of the packet queue before the controller begins to
+    # discard unprocessed packets. This should be sufficiently large that
+    # packet loss is minimized, however small enough that the program does not
+    # lock up when a single thread is failing to flush.
+    MAX_QUEUE = 10
+
+    def __init__(self, mode: SocketMode=SocketMode.TCP, km: KeyManager=None) -> None:
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+        self._mode = mode
+
+        self.km = km or KeyManager()
+        self.state_manager = None
+        self.cont_state_manager = None
+
+        # Create the socket(3) object
+        if mode == SocketMode.TCP:
+            self._sock = socket(AF_INET, SOCK_STREAM)
+        else:
+            self._sock = socket(AF_INET, SOCK_DGRAM)
+
+        self._queue_lock = threading.Lock()
+        self._queue_ready = threading.Event()
+        self._pa_queue_lock = threading.Lock()
+        self._pa_queue_ready = threading.Event()
+        # NOTE: queue.Queue doesn't work here because of not being able to
+        #       pop an item off based on a criteria.
+        self._queue = []
+        self._pa_queue = []
+
+        # Server stuff
+        self.server = False
+        self.clients = []
+        self._auth_clients = []
+
+        self.client_ids = {}
+
+        # Client stuff
+        self.auth_done = False
+        self.use_special_encryption = False
+        self.send_address = None
+        self.client_id = None
+
+        # If we are a TCP socket, we are going to need a pair of keys to use
+        # during the initial handshake.
+        if self.mode == SocketMode.TCP:
+            self.log.info('Generating RSA key')
+            self.key = RSA.generate(1024, Random.new().read)
+            self.pub_key = self.key.publickey()
+            self.log.info('Key gen finished')
+
+        self.sequence = 0
+
+    # Pass-through configuration
+    def bind(self, host: str, port: int) -> None:
+        self._sock.bind((host, port))
+
+    def connect(self, host: str, port: int) -> None:
+        if self.mode == SocketMode.TCP:
+            self._sock.connect((host, port))
+        else:
+            self.send_address = (host, port)
+
+    def listen(self, backlog: int) -> None:
+        self.server = True
+        self._sock.listen(backlog)
+
+    def accept(self) -> Tuple[socket, Address]:
+        return self._sock.accept()
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def getsockname(self) -> Address:
+        return self._sock.getsockname()
+
+    def getnameinfo(self) -> str:
+        return self._sock.getnameinfo()
+
+    # Hooks
+    def new_tcp_hook(self, sock: socket, addr: Address, client_id: bytes) -> None:
+        pass
+
+    def tcp_lost_hook(self, sock: socket, addr: Address) -> None:
+        pass
+
+    # Handlers
+    def tcp_lost(self, sock: socket, addr: Address) -> None:
+        """
+        Called when a TCP connection is dropped. :func:`tcp_lost_hook` should
+        be used to add user-definable hooks.
+        This function will propagate the event to an associated state manager.
+
+        :param socket sock: The socket(5) that disconnected
+        :param tuple addr: The address of the disconnecting client
+        """
+        if self.server:
+            self.clients.remove((sock, addr))
+            if sock in self._auth_clients:
+                self._auth_clients.remove(sock)
+
+            # if addr in self.client\_aes:
+            #     del self.client\_aes[addr]
+        self.log.info(f'Lost connection to {addr}')
+
+        if self.state_manager is not None:
+            self.state_manager.lost(sock, addr)
+        self.tcp_lost_hook(sock, addr)
+
+    def send(self, data: bytes,
+             to: Optional[Union[socket, Address]]=None) -> Optional[int]:
+        """
+        Transmit a packet. In the case of a TCP socket, the :param:`to` param
+        is not required. In a UDP socket, it is required in the case when
+        `send_address` is not also defined.
+
+        :param bytes data: The packet to send
+        :param tuple to: The address to send data to
+        :param socket to: The socket(5) to send data to
+        """
+        if self.mode == SocketMode.TCP:
+            if to is None:
+                if self.server:
+                    for i in self.clients:
+                        i[0].send(data)
+                    return
+                else:
+                    return self._sock.send(data)
+            if not isinstance(to, socket):
+                to = self.km.sock_from_id(to)
+            return to.send(data)
+
+        addr = to or self.send_address
+        self._sock.sendto(data, addr)
+
+    def start(self) -> None:
+        """
+        Initialise and begin this controller. This function spawns a number of
+        threads, then returns.
+        """
+        # Make sure we don't accidentally hog a port
+        self._sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+
+        if self.server and self.mode == SocketMode.TCP:
+            threading.Thread(
+                target=self._acceptor_loop,
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=self._handler_loop,
+                args=(self._sock, None),
+                daemon=True,
+            ).start()
+
+    def _acceptor_loop(self) -> None:
+        """
+        This function should only be used on a server instance. It is
+        responsible for waiting for new clients to connect, then initialising
+        the pair of threads each client receives.
+        This function should not be called manually.
+        """
+        while True:
+            conn, addr = self.accept()
+            threading.Thread(
+                target=self._handler_loop,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self.do_tcp_server_auth,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
+            self.clients.append((conn, addr))
+            self.log.debug(f'Got client {addr}')
+
+    def _handler_loop(self, sock: socket, addr: Address) -> None:
+        """
+        This function is responsible for handing incomming packets from the
+        controlled socket. It should never be called manually, as it is spawned
+        by other functions as required.
+
+        :param socket sock: The socket(5) instance being wrapped
+        :param tuple addr: The bound address
+        """
+        while True:
+            try:
+                if self.mode == SocketMode.TCP:
+                    packet = Packet.from_pipe(sock)
+                else:
+                    pdata, addr = sock.recvfrom(4096)
+                    packet = Packet.from_bytes(pdata)
+            except PacketError:
+                # TODO: Proper handling here
+                self.log.warning('Invalid packet encountered')
+                continue
+            except ConnectionResetError:
+                self.tcp_lost(sock, addr)
+                return
+
+            # Un-apply any encryption scheme on this connection
+            if self.client_id is None or self.use_special_encryption:
+                aes = self.km.get_aes(packet.client_id)
+            else:
+                aes = self.km.get_aes(self.client_id)
+            ppl = len(packet.payload)
+            if aes is not None:
+                try:
+                    packet.payload = unpad(aes[1].decrypt(packet.payload), 16)
+                except ValueError as e:
+                    self.log.error(f'Failed to decrypt AES: {e}')
+                    continue
+
+            self.log.debug('{0} bytes from {1} ({2} encrypted)'.format(len(packet.payload), addr, ppl))
+
+            # Push the packet to the appropriate queue
+            packet.source_addr = addr
+            packet.source_sock = sock
+
+            if self.auth_done or sock in self._auth_clients or self.mode == SocketMode.UDP:
+                with self._queue_lock:
+                    self._queue.append((sock, addr, packet))
+                    self._queue_ready.set()
+                    while len(self._queue) > self.MAX_QUEUE:
+                        self.log.error('Queue to large!')
+                        self._queue.pop(0)
+            else:
+                with self._pa_queue_lock:
+                    self._pa_queue.append((sock, addr, packet))
+                    self._pa_queue_ready.set()
+
+    def get_packet(self, blocking: bool=False, check: Optional[Callable]=None,
+                  in_auth: bool=False) -> Optional[Packet]:
+        """x
+        Pop up to one packet from the queue.
+
+        :param bool blocking: Whether the function should block for a matching
+                              packet, or return if no packets are avaiable.
+        :param func check: The custom check function used to match specific
+                           packets.
+        :param bool in_auth: If the packet should be requested from the auth
+                             queue. If this is true, a seperate queue is used.
+        """
+        # The queue for pre-auth sockets is different from post-auth
+        queue = self._queue if not in_auth else self._pa_queue
+        q_ready = self._queue_ready if not in_auth else self._pa_queue_ready
+        q_lock = self._queue_lock if not in_auth else self._pa_queue_lock
+
+        if blocking:
+            n = 0
+            while True:
+                # Wait for an item on the queue
+                q_ready.wait()
+                with q_lock:
+                    # If the packet fails the custom check...
+                    try:
+                        if check is not None and not check(queue[n]):
+                            # ...ignore it
+                            n += 1
+                            q_ready.clear()
+                            continue
+                    except IndexError:
+                        continue
+
+                    # Reset the queue\_ready flag to the correct value
+                    if len(queue) == 1:
+                        q_ready.clear()
+                    else:
+                        q_ready.set()
+                    return queue.pop(n)
+
+        with q_lock:
+            if queue:
+                # Find the first item on the queue matching the check
+                for n, i in enumerate(queue):
+                    if check is None or check(i):
+                        if len(queue) == 1:
+                            # Queue is empty, unset the flag.
+                            q_ready.clear()
+                        return queue.pop(n)
+            return None
+
+    def send_packet(self, opcode: int, payload: bytes,
+                    sequence: Optional[int]=None,
+                    to: Optional[Union[socket, Address]]=None,
+                    client_id: Optional[bytes]=None,
+                    origin: Optional[bytes]=None) -> None:
+        """
+        Construct and transmit a packet.
+
+        :param int opcode: The opcode of the packet
+        :param bytes payload: The packet payload
+        :param int sequence: The sequence number
+        :param tuple to: The address to send the packet to
+        :param socket to: The socket(5) to send the packet to
+        :param bytes client_id: The client id to used when selectnig the
+                                encryption scheme.
+        :param bytes origin: The client id of the sending party.
+        """
+        if sequence is None:
+            sequence = self.sequence
+            self.sequence += 1
+            self.sequence %= 0xff_ff
+        ts = int(time.time())
+
+        # If we're using an encryption scheme for this connection, apply it
+        if self.client_id is not None:
+            payload = self.km.get_aes(self.client_id)[0].encrypt(pad(payload, 16))
+        elif client_id is not None:
+            aes = self.km.get_aes(client_id)[0]
+            payload = aes.encrypt(pad(payload, 16))
+
+        origin = self.client_id or origin
+
+        # Construct and send the packet
+        packet = Packet.make_bytes(opcode, payload, ts, self.sequence, origin)
+        self.send(packet, to=to)
+
+    def do_tcp_client_auth(self) -> bytes:
+        """
+        Perform the authentication handshake with a server.
+        This function can only be used when in TCP mode, and when acting as a
+        client.
+        """
+        if self.mode != SocketMode.TCP:
+            self.log.error('!! REFUSING TO DO HANDSHAKE OUTSIDE OF TCP !!')
+            return
+
+        self.log.info('Starting client-server authentication')
+
+        def assert_op(packet, opcode):
+            if packet[2].opcode != opcode:
+                self.send_packet(ABRT, b'')
+                self.close()
+                raise HandshakeFailed
+
+        # Request authentication
+        self.send_packet(HELLO, b'')
+        resp = self.get_packet(True, in_auth=True)
+        assert_op(resp, ACK)
+
+        # Send our public key
+        self.send_packet(RSA_KEY, self.pub_key.exportKey('DER'))
+
+        # Get the AES parameters
+        resp = self.get_packet(True, in_auth=True)
+        assert_op(resp, AES_KEY)
+
+        # Build and RSA cipher, then an AES one
+        cipher = PKCS1_v1_5.new(self.key)
+        sentinel = Random.new().read(15 + SHA.digest_size)
+        aes_key = cipher.decrypt(resp[2].payload, sentinel)
+
+        key, iv = aes_key[:16], aes_key[32:]
+        nonce = aes_key[16:32]
+        aes = AES.new(key, AES.MODE_CBC, iv)
+        aes2 = AES.new(key, AES.MODE_CBC, iv)
+
+        # Return the encrypted nonce
+        self.send_packet(AES_CHECK, aes.encrypt(nonce))
+
+        # self.aes = (aes, aes2)
+        self.km.register(nonce, aes, aes2, key, iv, self._sock)
+
+        resp = self.get_packet(True, in_auth=True)
+        self.auth_done = True
+        assert_op(resp, ACK)
+
+        self.log.info('Client-server handshake complete')
+
+        self.client_id = nonce
+        return nonce
+
+    def do_tcp_server_auth(self, sock: socket, addr: Address) -> None:
+        """
+        Perform the authentication handshake with a client.
+        This function can only be used when operating in TCP mode, and acting
+        as a server.
+        """
+        if self.mode != SocketMode.TCP:
+            self.log.error('!! REFUSING TO DO HANDSHAKE OUTSIDE OF TCP !!')
+            return
+
+        self.log.debug('Starting server-client authentication')
+
+        def check(packet):
+            return packet[0] == sock
+
+        def assert_op(packet, opcode):
+            if packet[2].opcode != opcode:
+                self.send_packet(ABRT, b'', to=sock)
+                sock.close()
+                raise HandshakeFailed
+
+        # Get initial HELLO
+        hello = self.get_packet(True, check=check, in_auth=True)
+        assert_op(hello, HELLO)
+        # ACK it
+        self.send_packet(ACK, b'', to=sock)
+
+        # Get the client's RSA key
+        key = self.get_packet(True, check=check, in_auth=True)
+        assert_op(key, RSA_KEY)
+        client_key = RSA.importKey(key[2].payload)
+
+        # Construct a new AES 256 cipher
+        key = Random.get_random_bytes(16)
+        iv = Random.new().read(AES.block_size)
+        aes = AES.new(key, AES.MODE_CBC, iv)
+        aes2 = AES.new(key, AES.MODE_CBC, iv)
+        client_id = KeyManager.generate_client_id(key, addr)
+
+        # Encrypt the AES parameters using RSA
+        cipher = PKCS1_v1_5.new(client_key)
+        resp = cipher.encrypt(key + client_id + iv)
+
+        # Send the params to the client
+        self.send_packet(AES_KEY, resp, to=sock)
+
+        # Get the nonce-based AES check
+        nonce_resp = self.get_packet(True, check=check, in_auth=True)
+        assert_op(nonce_resp, AES_CHECK)
+
+        nonce_resp = aes2.decrypt(nonce_resp[2].payload)
+        if nonce_resp != client_id:
+            self.send_packet(ABRT, b'', to=sock)
+            sock.close()
+            raise HandshakeFailed
+
+        self.log.info('Server-client handshake complete')
+
+        # Register the client
+        self.km.register(client_id, aes, aes2, key, iv, sock)
+
+        self._auth_clients.append(sock)
+
+        # Send the final ACK to finish the handshake
+        self.send_packet(ACK, b'', to=client_id)
+
+        if self.state_manager is not None:
+            self.state_manager.new_client(sock, addr, client_id)
+
+        self.new_tcp_hook(sock, addr, client_id)
+
+        if self.cont_state_manager is not None:
+            self.cont_state_manager.new_cont_client(sock, addr, client_id)
+
+    @property
+    def mode(self) -> SocketMode:
+        return self._mode
+\end{pythoncode}
+\subsection{voiplib.state\_manager}
+\begin{pythoncode}
+import struct
+import time
+from typing import Tuple, List
+from socket import socket
+
+from .socket_controller import SocketController
+from .key_manager import KeyManager
+from .opcodes import *
+
+
+def ms(x):
+    return round(x * (44100 / 1000))
+
+
+class StateManager:
+    # attack, hold, release, threshold
+    DEFAULT_GATE = (ms(3.5), ms(10), ms(10), 950)
+    # attack, release, threshold
+    DEFAULT_COMP = (ms(1), ms(100), 10000)
+
+    DEFAULT_NAME = 'Nameless?'
+
+    def __init__(self, sock: SocketController, cont_sock: SocketController,
+                 km: KeyManager):
+        """
+        Create a new instance of a state manager.
+
+        :param SocketController sock: The standard socket to manage
+        :param SocketController cont_sock: The controll server socket to manage
+        :param KeyManager km: The key manager responsible for this connection.
+        """
+        self.gates = {}
+        self.compressors = {}
+        self.names = {}
+        self.km = km
+
+        self._sock = sock
+        self._sock.state_manager = self
+
+        self.rooms = []
+
+        self._cont_sock = cont_sock
+        self._cont_sock.cont_state_manager = self
+
+    def new_cont_client(self, _, __, client_id: bytes) -> None:
+        """
+        A hook bound to a socket controller, called when a new control surface
+        connects.
+        """
+        # Deal with race conditions
+        time.sleep(0.5)
+
+        for ci in self.gates:
+            r_data = bytearray([n for n in range(len(self.rooms)) if ci in self.rooms[n]])
+            r_data.insert(0, len(r_data))
+            name = bytearray([len(self.names[ci])])
+            name += self.names[ci].encode('latin-1')
+
+            gate, comp = self.gates.get(ci), self.compressors.get(ci)
+            if gate and comp and len(gate) == 4 and len(comp) == 3:
+                self._cont_sock.send_packet(
+                    CLIENT_JOIN,
+                    ci + struct.pack('!7H', *gate, *comp) + r_data + name,
+                )
+
+    def new_client(self, _, __, client_id: bytes) -> None:
+        """
+        A hook bound to a socket controller, called when a new client connects.
+        """
+        if client_id not in self.gates:
+            self.gates[client_id] = self.DEFAULT_GATE
+            self.compressors[client_id] = self.DEFAULT_COMP
+            self.names[client_id] = self.DEFAULT_NAME
+
+        if len(self.rooms) == 0:
+            self.rooms.append([])
+        for i in self.rooms:
+            if client_id in i:
+                break
+        else:
+            self.rooms[0].append(client_id)
+
+        sock = self.km.sock_from_id(client_id)
+        if sock is not None:
+            self._sock.send_packet(
+                SET_GATE,
+                struct.pack('!4lH', *self.gates[client_id], 0),
+                to=sock,
+                client_id=client_id
+            )
+            self._sock.send_packet(
+                SET_COMP,
+                struct.pack('!3lH', *self.compressors[client_id], 0),
+                to=sock,
+                client_id=client_id
+            )
+
+        r_data = bytearray([n for n in range(len(self.rooms)) if client_id in self.rooms[n]])
+        r_data.insert(0, len(r_data))
+        name = bytearray([len(self.names[client_id])])
+        name += self.names[client_id].encode('latin-1')
+
+        self._cont_sock.send_packet(
+            CLIENT_JOIN,
+            client_id + struct.pack('!7H', *self.gates[client_id],
+                                    *self.compressors[client_id])
+                      + r_data + name
+        )
+
+    def set_rooms(self, client_id: bytes, rooms: List[int]) -> None:
+        """
+        Set the rooming state for a given client.
+        """
+        for i in rooms:
+            while i >= len(self.rooms):
+                self.rooms.append([])
+
+        for n, i in enumerate(self.rooms):
+            if client_id in i and n not in rooms:
+                i.remove(client_id)
+            elif client_id not in i and n in rooms:
+                i.append(client_id)
+
+    def set_name(self, client_id: bytes, name: str) -> None:
+        """
+        Set the name for a given client
+        """
+        self.names[client_id] = name
+
+    def set_gate(self, client_id: bytes, gate: Tuple) -> None:
+        """
+        Set the gate configuration for a given client
+        """
+        self.gates[client_id] = gate
+
+    def set_compressor(self, client_id: bytes, compressor: Tuple) -> None:
+        """
+        Set the compressor configuration for a given client
+        """
+        self.compressors[client_id] = compressor
+
+    def lost(self, sock: socket, _) -> None:
+        """
+        This is a hook bound to a socket controller, called when a TCP client
+        disconnects from a server. It is responsible for cleaning up the state
+        for that, now disconnected, client.
+        """
+        client_id = self.km.id_from_sock(sock)
+        if client_id is None:
+            return
+        if client_id in self.gates:
+            del self.gates[client_id]
+        if client_id in self.compressors:
+            del self.compressors[client_id]
+        if client_id in self.names:
+            del self.names[client_id]
+        for i in self.rooms:
+            if client_id in i:
+                i.remove(client_id)
+\end{pythoncode}
+\subsection{voiplib.util.opus}
+\begin{pythoncode}
+from ctypes import (
+    POINTER, c_int, c_int32, c_char_p, Structure, c_int16, CDLL, byref, cast, c_char, cdll
+)
+import ctypes.util
+import array
+import sys
+import os
+
+
+if sys.platform == 'win32':
+    opuslib = CDLL(os.path.join(os.path.dirname(__file__), '../bin/libopus-0.x64.dll'))
+else:
+    opuslib = cdll.LoadLibrary(ctypes.util.find_library('opus'))
+
+
+class OpusEncoder_(Structure): pass
+class OpusDecoder_(Structure): pass
+class OpusError(Exception): pass
+
+
+FUNCTIONS = {
+    'opus_encoder_create': (
+        (c_int, c_int, c_int, POINTER(c_int)),
+        POINTER(OpusEncoder_)),
+    'opus_encoder_ctl': (None, c_int32),
+
+    'opus_decoder_create': (
+        (c_int, c_int, POINTER(c_int)),
+        POINTER(OpusDecoder_)),
+
+    'opus_decode': (
+        (POINTER(OpusDecoder_), c_char_p, c_int32, POINTER(c_int16), c_int, c_int),
+        c_int),
+    'opus_encode': (
+        (POINTER(OpusEncoder_), POINTER(c_int16), c_int, c_char_p, c_int32),
+        c_int32),
+
+    'opus_encoder_destroy': ((POINTER(OpusEncoder_), ), None),
+    'opus_decoder_destroy': ((POINTER(OpusDecoder_), ), None),
+
+    'opus_packet_get_samples_per_frame': ((c_char_p, c_int), c_int),
+    'opus_packet_get_nb_frames': ((c_char_p, c_int), c_int),
+    'opus_packet_get_nb_channels': ((c_char_p, ), c_int),
+}
+for i in FUNCTIONS:
+    func = getattr(opuslib, i)
+    if FUNCTIONS[i][0] is not None:
+        func.argtypes = FUNCTIONS[i][0]
+    func.restype = FUNCTIONS[i][1]
+
+
+class OpusEncoder:
+    SAMPLE_RATE = 48000
+    CHANNELS = 1
+
+    FRAME_LENGTH = 20
+    SAMPLE_SIZE = 2 # (bit\_rate / 8) * CHANNELS (bit\_rate == 16)
+    SAMPLES_PER_FRAME = int(SAMPLE_RATE / 1000 * FRAME_LENGTH)
+
+    FRAME_SIZE = SAMPLES_PER_FRAME * SAMPLE_SIZE
+
+    APPLICATION_AUDIO    = 2049
+    APPLICATION_VOIP     = 2048
+    APPLICATION_LOWDELAY = 2051
+    CTL_SET_BITRATE      = 4002
+    CTL_SET_BANDWIDTH    = 4008
+    CTL_SET_FEC          = 4012
+    CTL_SET_PLP          = 4014
+    CTL_SET_SIGNAL       = 4024
+
+    def __init__(self):
+        err = c_int()
+        self.encoder = opuslib.opus_encoder_create(
+            self.SAMPLE_RATE, self.CHANNELS, self.APPLICATION_VOIP, byref(err)
+        )
+        if err.value < 0:
+            raise OpusError(err)
+        self.set_bitrate(128)
+
+    def set_bitrate(self, kbps):
+        opuslib.opus_encoder_ctl(
+            self.encoder, self.CTL_SET_BITRATE, int(kbps * 1024)
+        )
+
+    def encode(self, pcm, frame_size=None):
+        if frame_size is None:
+            frame_size = self.SAMPLES_PER_FRAME
+
+        max_data_bytes = len(pcm)
+        pcm = cast(pcm, POINTER(c_int16))
+        data = (c_char * max_data_bytes)()
+
+        res = opuslib.opus_encode(self.encoder, pcm, frame_size, data, max_data_bytes)
+        if res < 0:
+            raise OpusError(res)
+
+        return array.array('b', data[:res]).tobytes()
+
+
+class OpusDecoder:
+    def __init__(self):
+        err = c_int()
+        self.decoder = opuslib.opus_decoder_create(
+            OpusEncoder.SAMPLE_RATE, OpusEncoder.CHANNELS, byref(err)
+        )
+        if err.value < 0:
+            raise OpusError(err)
+
+    def decode(self, data, frame_size=None, fec=False):
+        if frame_size is None:
+            frames = opuslib.opus_packet_get_nb_frames(data, len(data))
+            samples_per_frame = opuslib.opus_packet_get_samples_per_frame(data, OpusEncoder.SAMPLE_RATE)
+            # channels = opuslib.opus\_packet\_get\_nb\_channels(data)
+
+            frame_size = frames * samples_per_frame
+
+        pcm_size = frame_size * OpusEncoder.CHANNELS
+        pcm = (c_int16 * pcm_size)()
+        pcm_ptr = cast(pcm, POINTER(c_int16))
+
+        res = opuslib.opus_decode(self.decoder, data, len(data), pcm_ptr, frame_size, int(fec))
+        if res < 0:
+            raise OpusError(res)
+
+        return array.array('h', pcm).tobytes()
+\end{pythoncode}
+\subsection{voiplib.util.packets}
+\begin{pythoncode}
+import struct
+
+from .._voiplib.crc import CRC
+from . import util
+
+
+class PacketError(Exception):
+    pass
+
+
+class Packet:
+    EPOCH = 1563520000
+
+    CRC_LENGTH = 2
+    CRC16 = CRC(CRC_LENGTH * 8, 0x1337)
+
+    def __init__(self, opcode, payload, timestamp, sequence, client_id=None):
+        self.opcode = opcode
+        self.payload = payload
+        self.timestamp = timestamp
+        self.sequence = sequence
+        if client_id is None:
+            client_id = b'\0' * 16
+        self.client_id = client_id
+
+        self.source_addr = None
+        self.source_sock = None
+
+    @classmethod
+    def make_bytes(cls, opcode, payload, timestamp, sequence, client_id=None):
+        if len(payload) > 0xff_ff:
+            raise PacketError('Payload too long')
+        if not (0 <= timestamp - cls.EPOCH <= 0xff_ff_ff_ff):
+            raise PacketError('Invalid timestamp')
+
+        if client_id is None:
+            client_id = b'\0' * 16
+
+        packet = struct.pack('!BIHH', opcode, timestamp - cls.EPOCH, len(payload), sequence)
+        packet += client_id
+        packet += payload
+        packet += cls.CRC16(packet)
+
+        return packet
+
+    def digest(self):
+        return self.make_bytes(self.opcode, self.payload, self.timestamp, self.sequence, self.client_id)
+
+    @classmethod
+    def from_bytes(cls, packet):
+        opcode, timestamp, _, sequence = struct.unpack('!BIHH', packet[:9])
+        timestamp += cls.EPOCH
+        payload = packet[9:-cls.CRC_LENGTH]
+        client_id = payload[:16]
+        payload = payload[16:]
+
+        if cls.CRC16(packet[:-cls.CRC_LENGTH]) != packet[-cls.CRC_LENGTH:]:
+            raise PacketError('Invalid CRC on packet')
+
+        return cls(opcode, payload, timestamp, sequence, client_id)
+
+    @classmethod
+    def from_pipe(cls, pipe):
+        head = util.read(pipe, 9)
+        opcode, timestamp, length, sequence = struct.unpack('!BIHH', head)
+        timestamp += cls.EPOCH
+        client_id = util.read(pipe, 16)
+        payload = util.read(pipe, length)
+        crc = util.read(pipe, cls.CRC_LENGTH)
+
+        if cls.CRC16(head + client_id + payload) != crc:
+            raise PacketError('Invalid CRC on packet')
+
+        return cls(opcode, payload, timestamp, sequence, client_id)
+\end{pythoncode}
+\subsection{voiplib.util.util}
+\begin{pythoncode}
+def read(pipe, length: int) -> bytes:
+    """
+    Read data from a given unput until the required amount of data has been
+    read. Required in cases such as sockets where a read operationg will not
+    always return all of the required data, due to buffering.
+    """
+    data = b''
+    recv = getattr(pipe, 'recv', getattr(pipe, 'read', None))
+    while len(data) < length:
+        data += recv(length - len(data))
+    return data
+\end{pythoncode}
+\subsection{voiplib.\_\_init\_\_}
+\begin{pythoncode}
+from .server import Server
+from .client import Client
+\end{pythoncode}
+\subsection{voiplib.\_\_main\_\_}
+\begin{pythoncode}
+import sys
+
+if __name__ == '__main__':
+    if 'server' in sys.argv:
+        from .server import Server
+
+        Server().mainloop()
+    else:
+        from .client import Client
+
+        Client().mainloop()
+\end{pythoncode}
+\subsection{scripts.tests}
+\begin{pythoncode}
+import unittest
+import io
+
+from voiplib.util.packets import Packet, PacketError
+
+
+class TestPackets(unittest.TestCase):
+    def test_forwards(self):
+        packet = Packet(0, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Manually constructed packet
+        self.assertEqual(p_bytes, b'\x00\x00\x88\x00h\x00\t\x04\xd2test data\x08\x11')
+
+    def test_raises(self):
+        packet = Packet(0, b'test data', 2e32, 0)
+        with self.assertRaises(PacketError):
+            packet.digest()
+
+        packet = Packet(0, b'a' * 0xff_ff_ff, 1563528913000, 1234)
+        with self.assertRaises(PacketError):
+            packet.digest()
+
+    def test_packet_crc(self):
+        packet = Packet(0, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Invalidate the CRC
+        p_bytes = p_bytes[:-packet.CRC_LENGTH] + (b'\0' * packet.CRC_LENGTH)
+
+        with self.assertRaises(PacketError):
+            Packet.from_bytes(p_bytes)
+
+        # Simulated pipe
+        pipe = io.BytesIO()
+        pipe.write(p_bytes)
+        pipe.seek(0)
+
+        with self.assertRaises(PacketError):
+            Packet.from_pipe(pipe)
+
+    def test_reverse(self):
+        # This is already tested in test\_forwards and can be trusted
+        packet = Packet(57, b'test data', 1563528913000, 1234)
+        p_bytes = packet.digest()
+
+        # Can we get the data back out?
+        packet2 = Packet.from_bytes(p_bytes)
+        self.assertEqual(packet2.opcode, 57)
+        self.assertEqual(packet2.payload, b'test data')
+        self.assertEqual(packet2.timestamp, 1563528913000)
+        self.assertEqual(packet2.sequence, 1234)
+
+    def test_pipes(self):
+        # This is already tested in test\_forwards and can be trusted
+        packet = Packet(57, b'test data', 1563528913000, 1234)
+        pipe = io.BytesIO()
+        pipe.write(packet.digest())
+        pipe.seek(0)
+
+        # Using the BytesIO as a simulated pipe
+        packet2 = Packet.from_pipe(pipe)
+        self.assertEqual(packet2.opcode, 57)
+        self.assertEqual(packet2.payload, b'test data')
+        self.assertEqual(packet2.timestamp, 1563528913000)
+        self.assertEqual(packet2.sequence, 1234)
+
+
+if __name__ == '__main__':
+    unittest.main()
+\end{pythoncode}
+\subsection{src.audio}
+\begin{pythoncode}
+\##define PY\_SSIZE\_T\_CLEAN
+#include <Python.h>
+
+#include "stdint.h"
+#include "stdio.h"
+
+typedef struct {
+    PyObject_HEAD
+
+    double gain;
+    double amp;
+    double _mig;
+    double _mag;
+    unsigned int _frame;
+
+    unsigned long attack;
+    unsigned long release;
+    unsigned long threshold;
+    double exp;
+    unsigned int _c_start;
+    unsigned int _c_end;
+} CompressorObject;
+
+static int Compressor_init(CompressorObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"attack", "release", "threshold", "exp", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kkk|d", kwlist,
+                                     &self->attack, &self->release,
+                                     &self->threshold, &exp))
+        return -1;
+
+    self->gain = 1;
+    self->amp = 0;
+    self->_mig = 0;
+    self->_mag = 0;
+    self->_frame = 0;
+    self->_c_start = 0;
+    self->_c_end = 0;
+
+    self->exp = exp;
+
+    return 0;
+}
+
+static PyObject* Compressor_feed(CompressorObject *self, PyObject *args) {
+    const char* data;
+    Py_ssize_t dlen;
+    if (!PyArg_ParseTuple(args, "s#", &data, &dlen))
+        return NULL;
+
+    char* data_out = PyMem_Malloc(dlen);
+
+    for (int i = 0; i < dlen; i += 2) {
+        int16_t frame_s = (int16_t)((uint8_t)data[i] | (uint8_t)data[i + 1] << 8);
+        self->_frame++;
+        double frame = (double)frame_s;
+        self->amp = ((frame < 0 ? -frame : frame) * self->exp) + (1. - self->exp) * self->amp;
+
+        if (self->amp * self->gain < self->threshold) {
+            if (self->_c_start == 0) {
+                self->_mag = self->gain;
+                self->_c_start = self->_frame;
+                self->_c_end = 0;
+            }
+            self->gain = self->_mig + (double)(self->_frame - self->_c_start) / self->release;
+            if (self->gain > 1)
+                self->gain = 1.;
+            if (self->gain > self->_mag)
+                self->_mag = self->gain;
+        } else {
+            if (self->_c_end == 0) {
+                self->_mig = self->gain;
+                self->_mag = 1. - self->_mag;
+                self->_c_end = self->_frame;
+                self->_c_start = 0;
+            }
+            self->gain = 1. - (double)(self->_frame - self->_c_end) / self->attack - self->_mag;
+            if (self->gain < 0)
+                self->gain = 0.;
+            if (self->_mig > self->gain)
+                self->_mig = self->gain;
+        }
+
+        data_out[i] = (uint8_t)((int16_t)(frame_s * self->gain) >> 0);
+        data_out[i + 1] = (uint8_t)((int16_t)(frame_s * self->gain) >> 8);
+    }
+
+    PyObject *result = PyBytes_FromStringAndSize(data_out, dlen);
+    PyMem_Free(data_out);
+    return result;
+}
+
+static PyObject* Compressor_get_attack(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->attack);
+}
+static int Compressor_set_attack(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Attack must be an integer");
+        return -1;
+    }
+    self->attack = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Compressor_get_release(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->release);
+}
+static int Compressor_set_release(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Release must be an integer");
+        return -1;
+    }
+    self->release = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Compressor_get_threshold(CompressorObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->threshold);
+}
+static int Compressor_set_threshold(CompressorObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Threshold must be an integer");
+        return -1;
+    }
+    self->threshold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyGetSetDef Compressor_getsetters[] = {
+    {"attack", (getter) Compressor_get_attack, (setter) Compressor_set_attack, "", NULL},
+    {"release", (getter) Compressor_get_release, (setter) Compressor_set_release, "", NULL},
+    {"threshold", (getter) Compressor_get_threshold, (setter) Compressor_set_threshold, "", NULL},
+    {NULL}
+};
+static PyMethodDef Compressor_methods[] = {
+    {"feed", (PyCFunction) Compressor_feed, METH_VARARGS, ""},
+    {NULL}
+};
+static PyTypeObject CompressorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "audio.Compressor",
+    .tp_doc = "Compressor object",
+    .tp_basicsize = sizeof(CompressorObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) Compressor_init,
+    .tp_methods = Compressor_methods,
+    .tp_getset = Compressor_getsetters,
+};
+
+typedef struct {
+    PyObject_HEAD
+
+    double gain;
+    double amp;
+    double _mig;
+    double _mag;
+    unsigned int _frame;
+
+    unsigned long attack;
+    unsigned long hold;
+    unsigned long release;
+    unsigned long threshold;
+    double exp;
+    unsigned int _c_start;
+    unsigned int _c_end;
+} GateObject;
+
+static int Gate_init(GateObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"attack", "hold", "release", "threshold", "exp", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kkkk|d", kwlist,
+                                     &self->attack, &self->hold,
+                                     &self->release, &self->threshold,
+                                     &exp))
+        return -1;
+
+    self->gain = 1;
+    self->amp = 0;
+    self->_mig = 0;
+    self->_mag = 0;
+    self->_frame = 0;
+    self->_c_start = 0;
+    self->_c_end = 0;
+
+    self->exp = exp;
+
+    return 0;
+}
+
+static PyObject* Gate_feed(GateObject *self, PyObject *args) {
+    const char* data;
+    Py_ssize_t dlen;
+    if (!PyArg_ParseTuple(args, "s#", &data, &dlen))
+        return NULL;
+
+    char* data_out = PyMem_Malloc(dlen);
+
+    for (int i = 0; i < dlen; i += 2) {
+        int16_t frame_s = (int16_t)((uint8_t)data[i] | (uint8_t)data[i + 1] << 8);
+        self->_frame++;
+        double frame = (double)frame_s;
+        self->amp = ((frame < 0 ? -frame : frame) * self->exp) + (1. - self->exp) * self->amp;
+
+        if (self->amp > self->threshold) {
+            if (self->_c_start == 0) {
+                self->_mag = self->gain;
+                self->_c_start = self->_frame;
+                self->_c_end = 0;
+            }
+            self->gain = self->_mig + (double)(self->_frame - self->_c_start) / self->attack;
+            if (self->gain > 1)
+                self->gain = 1.;
+            if (self->gain > self->_mag)
+                self->_mag = self->gain;
+        } else {
+            if (self->_c_end == 0) {
+                self->_mig = self->gain;
+                self->_mag = 1. - self->_mag;
+                self->_c_end = self->_frame;
+                self->_c_start = 0;
+            }
+            if (self->_frame - self->_c_end >= self->hold) {
+                self->gain = 1. - (double)(self->_frame - self->_c_end - self->hold) / self->release - self->_mag;
+                if (self->gain < 0)
+                    self->gain = 0.;
+            }
+            if (self->_mig > self->gain)
+                self->_mig = self->gain;
+        }
+
+        data_out[i] = (uint8_t)((int16_t)(frame_s * self->gain) >> 0);
+        data_out[i + 1] = (uint8_t)((int16_t)(frame_s * self->gain) >> 8);
+    }
+
+    PyObject *result = PyBytes_FromStringAndSize(data_out, dlen);
+    PyMem_Free(data_out);
+    return result;
+}
+
+static PyObject* Gate_get_attack(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->attack);
+}
+static int Gate_set_attack(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Attack must be an integer");
+        return -1;
+    }
+    self->attack = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_hold(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->hold);
+}
+static int Gate_set_hold(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Hold must be an integer");
+        return -1;
+    }
+    self->hold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_release(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->release);
+}
+static int Gate_set_release(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Release must be an integer");
+        return -1;
+    }
+    self->release = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyObject* Gate_get_threshold(GateObject *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->threshold);
+}
+static int Gate_set_threshold(GateObject *self, PyObject *value, void *closure) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+        return -1;
+    }
+    if (!PyLong_Check(value)) {
+        PyErr_SetString(PyExc_TypeError, "Threshold must be an integer");
+        return -1;
+    }
+
+    self->threshold = PyLong_AsUnsignedLong(value);
+    return 0;
+}
+
+static PyGetSetDef Gate_getsetters[] = {
+    {"attack", (getter) Gate_get_attack, (setter) Gate_set_attack, "", NULL},
+    {"hold", (getter) Gate_get_hold, (setter) Gate_set_hold, "", NULL},
+    {"release", (getter) Gate_get_release, (setter) Gate_set_release, "", NULL},
+    {"threshold", (getter) Gate_get_threshold, (setter) Gate_set_threshold, "", NULL},
+    {NULL}
+};
+static PyMethodDef Gate_methods[] = {
+    {"feed", (PyCFunction) Gate_feed, METH_VARARGS, ""},
+    {NULL}
+};
+static PyTypeObject GateType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "audio.Gate",
+    .tp_doc = "Gate object",
+    .tp_basicsize = sizeof(GateObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) Gate_init,
+    .tp_methods = Gate_methods,
+    .tp_getset = Gate_getsetters,
+};
+
+
+static PyMethodDef ModuleMethods[] = {
+    {NULL, NULL, 0, NULL}
+};
+
+
+static struct PyModuleDef audiomodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "audio",
+    .m_doc = NULL,
+    .m_size = -1,
+    ModuleMethods
+};
+
+PyMODINIT_FUNC PyInit_audio(void) {
+    PyObject *m;
+    if (PyType_Ready(&GateType) < 0)
+        return NULL;
+    if (PyType_Ready(&CompressorType) < 0)
+        return NULL;
+
+    m = PyModule_Create(&audiomodule);
+    if (m == NULL)
+        return NULL;
+
+    Py_INCREF(&GateType);
+    PyModule_AddObject(m, "Gate", (PyObject *) &GateType);
+    Py_INCREF(&CompressorType);
+    PyModule_AddObject(m, "Compressor", (PyObject *) &CompressorType);
+    return m;
+}
+\end{pythoncode}
+\subsection{src.crc}
+\begin{pythoncode}
+\##define PY\_SSIZE\_T\_CLEAN
+#include <Python.h>
+
+#include "stdint.h"
+
+
+typedef struct {
+    PyObject_HEAD
+
+    int _size;
+    int _polynomial;
+    int table[256];
+} CRCObject;
+
+static int CRC_init(CRCObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"size", "polynomial", NULL};
+
+    const double exp = 0.9;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "kk", kwlist,
+                                     &self->_size, &self->_polynomial))
+        return -1;
+    
+    for (int i = 0; i < 256; i++) {
+        int crc_accumulator = i << (self->_size - 8);
+
+        for (int j = 0; j < 8; j++) {
+            if (crc_accumulator & (1 << (self->_size - 1)))
+                crc_accumulator = (crc_accumulator << 1) ^ self->_polynomial;
+            else
+                crc_accumulator = crc_accumulator << 1;
+        }
+        self->table[i] = crc_accumulator;
+    }
+
+    return 0;
+}
+
+static PyObject* CRC_call(CRCObject *self, PyObject *args, PyObject *kwds) {
+    const char* data;
+    Py_ssize_t dlen;
+    int accumulator = 0;
+    static char *kwlist[] = {"data", "accumulator", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#|k", kwlist,
+                                     &data, &dlen, &accumulator))
+        return NULL;
+
+    for (int i = 0; i < dlen; i++) {
+        int j = ((accumulator >> (self->_size - 8)) ^ data[i]) & 0xff;
+        accumulator = ((accumulator << 8) ^ self->table[j]) & ((1 << self->_size) - 1);
+    }
+
+    char* data_out = PyMem_Malloc(2);
+    data_out[0] = (uint8_t)(accumulator >> 8);
+    data_out[1] = (uint8_t)(accumulator);
+    return PyBytes_FromStringAndSize(data_out, 2);
+}
+
+static PyMethodDef CRC_methods[] = {
+    {NULL}
+};
+static PyTypeObject CRCType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "crc.CRC",
+    .tp_doc = "CRC object",
+    .tp_basicsize = sizeof(CRCObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+
+    .tp_init = (initproc) CRC_init,
+    .tp_call = CRC_call,
+    .tp_methods = CRC_methods,
+};
+
+static PyMethodDef ModuleMethods[] = {
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef crcmodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "crc",
+    .m_doc = NULL,
+    .m_size = -1,
+    ModuleMethods
+};
+
+PyMODINIT_FUNC PyInit_crc(void) {
+    PyObject *m;
+    if (PyType_Ready(&CRCType) < 0)
+        return NULL;
+
+    m = PyModule_Create(&crcmodule);
+    if (m == NULL)
+        return NULL;
+
+    Py_INCREF(&CRCType);
+    PyModule_AddObject(m, "CRC", (PyObject *) &CRCType);
+    return m;
+}
+\end{pythoncode}
+\subsection{voiplib.audioio}
+\begin{pythoncode}
+import struct
+import threading
+
+import numpy as np
+import pyaudio
+
+from .audio_processors import OpusEncProcessor, OpusDecProcessor
+from .util.packets import Packet
+from .muxer import Muxer
+from . import loggers
+
+
+class AudioIO:
+    """
+    The main class responsible for audio input, output, and pipelineing.
+    """
+
+    CHUNK = 256
+
+    def __init__(self) -> None:
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+        self.pa = pyaudio.PyAudio()
+
+        # Locate all input and output audio hardware devices
+        self.inputs = []
+        self.outputs = []
+        for i in range(self.pa.get_device_count()):
+            info = self.pa.get_device_info_by_index(i)
+            idata = (
+                i, info['name'], info['hostApi'], info['defaultSampleRate']
+            )
+            if info['maxInputChannels']:
+                self.inputs.append(idata)
+            if info['maxOutputChannels']:
+                self.outputs.append(idata)
+
+        # Bind to the most appropriate input and output devices
+        self.in_stream = self.pa.open(
+            channels=1,
+            format=8,
+            rate=int(self.inputs[0][3]),
+            input=True,
+            frames_per_buffer=self.CHUNK,
+            input_device_index=self.inputs[0][0]
+        )
+        self.out_stream = self.pa.open(
+            channels=1,
+            format=8,
+            rate=int(self.outputs[0][3]),
+            output=True,
+            frames_per_buffer=self.CHUNK,
+            input_device_index=self.outputs[0][0]
+        )
+
+        self.log.info(f'Opened "{self.inputs[0][1]}" as input')
+        self.log.info(f'   and "{self.outputs[0][1]}" as output')
+
+        # Create our two dummy pipelines
+        self.pipeline = [OpusEncProcessor()]
+        self.back_pipeline = [OpusDecProcessor()]
+        self._back_pipeline = {}
+
+        # Setup a muxer instance for the output pipeline
+        self.muxer = Muxer()
+
+    def begin(self) -> None:
+        """
+        Start the audio interface and begin feeding the pipelines
+        """
+        threading.Thread(target=self._audio_player, daemon=True).start()
+        threading.Thread(target=self._in_watcher, daemon=True).start()
+
+    def _audio_player(self) -> None:
+        """
+        Constantly flush data from the muxer and feed it to the output device
+        """
+        while True:
+            frame = self.muxer.read()
+            if frame is None:
+                continue
+            self.out_stream.write(frame)
+
+    def _new_pipeline(self, client_id: bytes) -> None:
+        """
+        Setup a new client-specific pipleine for processing pre-mix
+        """
+        self._back_pipeline[client_id] = [
+            i.clone() for i in self.back_pipeline
+        ]
+
+    def feed(self, data: bytes, packet: Packet) -> None:
+        """
+        Feed audio into the pipeline
+
+        :param bytes data: The audio data
+        :param Packet packet: The Packet, including metadata 
+        """
+        # The first two bytes of the data are an unsigned short containg the
+        # rms aplitude
+        amp = struct.unpack('!H', data[:2])[0]
+
+        # If this client doesn't exist in our pipelines, create a new one for
+        # them.
+        if packet.client_id not in self._back_pipeline:
+            self._new_pipeline(packet.client_id)
+
+        data = data[2:]
+        # Feed the data through the pipeline
+        for i in self._back_pipeline[packet.client_id]:
+            data = i(data, packet, amp)
+            # Someone wants us to stop
+            if data is None:
+                return
+
+        # Let the muxer know there's new data
+        self.muxer.write(data, packet.client_id)
+
+    def _in_watcher(self) -> None:
+        """
+        This thread monitors the incomming audio stream and spawns a new thread
+        each time there is aditional data to process.
+
+        As Python threads are very cheap to create, this is an acceptable use
+        as the execution is significantly slowed if the data handler fails to
+        complete before the next chunk of data is waiting in the buffer.
+        """
+        sequence = 0
+        while True:
+            data = self.in_stream.read(
+                self.CHUNK, exception_on_overflow=False)
+            threading.Thread(target=self._handle_in_data,
+                             args=(data, sequence)).start()
+
+    def _handle_in_data(self, data: bytes, sequence: int) -> None:
+        """
+        Processing incomming data.
+        If this data is from a socket, we will want to know the order it came
+        in. This is just transparently passed down to pipeline modules,
+        however, so is of little concern here.
+
+        :param bytes data: The raw PCM data
+        :param int sequence: The audio sequence number
+        """
+        # Calculate the RMS of the audio
+        samps = np.ndarray((len(data) // 2), '<h', data).astype(np.int32)
+        amp = np.sqrt(np.mean(samps ** 2))
+        amp = int(amp)
+
+        # Show a visualisation of the RMS, enabled for testing
+        if False:
+            print(('*' * int((amp / 32768) * 500)).center(300))
+
+        # Pass the data down through the pipeline
+        for i in self.pipeline:
+            data = i(data, sequence, amp)
+            # Someone wants us to stop
+            if data is None:
+                break
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.base}
+\begin{pythoncode}
+import abc
+
+
+class AudioProcessor(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def process(self, data, packet, amp):
+        pass
+
+    def __call__(self, data, *args):
+        return self.process(data, *args)
+
+    def clone(self):
+        return self.__class__()
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.compressor}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .._voiplib.audio import Compressor as Compressor_
+
+
+class Compressor(AudioProcessor):
+    def __init__(self, attack, release, threshold, exp=0.9):
+        self.comp = Compressor_(attack, release, threshold, exp)
+
+    def process(self, data, *args):
+        return self.comp.feed(data)
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.gate}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .._voiplib.audio import Gate as Gate_
+
+
+class Gate(AudioProcessor):
+    def __init__(self, attack, hold, release, threshold, exp=0.9):
+        self.gate = Gate_(attack, hold, release, threshold, exp)
+
+    def process(self, data, *args):
+        return self.gate.feed(data)
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.jitter\_buffer}
+\begin{pythoncode}
+import heapq
+
+from .base import AudioProcessor
+
+
+class JitterBuffer(AudioProcessor):
+    ROLLOVER = 50
+    BUFFER = 5
+
+    def __init__(self):
+        self.latest = 0
+        self.heap = []
+
+    def process(self, data, packet, *_):
+        if self.ROLLOVER < packet.sequence < self.latest:
+            return None
+        heapq.heappush(self.heap, (packet.sequence, data))
+
+        while len(self.heap) >= self.BUFFER:
+            popped = heapq.heappop(self.heap)
+            if self.latest >= popped[0] > self.ROLLOVER:
+                continue
+            if self.latest == 0:
+                self.latest = popped[0]
+            else:
+                self.latest += 1
+            # if self.latest != popped[0]:
+            #    heapq.heappush(self.heap, (packet.sequence, data))
+            return popped[1]
+        return None
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.null\_sink}
+\begin{pythoncode}
+from .base import AudioProcessor
+
+
+class NullSink(AudioProcessor):
+    def process(self, *args):
+        return None
+\end{pythoncode}
+\subsection{voiplib.audio\_processors.opus}
+\begin{pythoncode}
+from .base import AudioProcessor
+from .. import loggers
+from ..util.opus import OpusEncoder, OpusDecoder
+
+
+class OpusEncProcessor(AudioProcessor):
+    def __init__(self):
+        self.log = loggers.getLogger(__name__ + '.' + self.__class__.__name__)
+
+        self.encoder = OpusEncoder()
+        self.buffer = b''
+
+    def process(self, data, *args):
+        self.buffer += data
+        if len(self.buffer) < self.encoder.FRAME_SIZE:
+            return
+        frame = self.buffer[:self.encoder.FRAME_SIZE]
+        self.buffer = self.buffer[self.encoder.FRAME_SIZE:]
+        if len(self.buffer) > self.encoder.FRAME_SIZE:
+            self.log.warning('Audio underrun detected! Flushing buffer!')
+            self.buffer = self.buffer[:self.encoder.FRAME_SIZE]
+
+        return self.encoder.encode(frame)
+
+
+class OpusDecProcessor(AudioProcessor):
+    def __init__(self):
+        self.decoder = OpusDecoder()
+
+    def process(self, data, *args):
+        # noinspection PyBroadException
+        try:
+            return self.decoder.decode(data)
+        except:
+            return None
+\end{pythoncode}

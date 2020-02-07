@@ -1,10 +1,11 @@
-import struct
-import sys
 import threading
-
+import struct
 import math
-from PyQt4.QtCore import *
-from PyQt4.QtGui import *
+import sys
+
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
 
 from ..audio import AudioIO
 from ..audio_processors.base import AudioProcessor
@@ -16,6 +17,32 @@ CLEAR_SCROLL = """
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollArea > QWidget > QScrollBar { background: palette(base); }
+"""
+
+ROUND_BUTTON = """
+QPushButton {
+    border: 2px solid #8f8f91;
+    border-radius: 60px;
+    min-width: 120px;
+    max-width: 120px;
+    min-height: 120px;
+    max-height: 120px;
+    background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                      stop: 0 #f6f7fa, stop: 1 #dadbde);
+}
+
+QPushButton:pressed {
+    background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                      stop: 0 #dadbde, stop: 1 #f6f7fa);
+}
+
+QPushButton:flat {
+    border: none; /* no border for a flat push button */
+}
+
+QPushButton:default {
+    border-color: navy; /* make the default button prominent */
+}
 """
 
 POW_2 = math.pow(2, (5 / 6)) / 2
@@ -70,41 +97,54 @@ class SocketManager:
             pkt = cls.udp_recv.get_packet(True)
 
             if pkt[2].opcode == AUDIO:
-                cls.aio.feed(pkt[2].payload, pkt[2])
+                try:
+                    cls.aio.feed(pkt[2].payload, pkt[2])
+                except:
+                    pass
 
     @classmethod
     def tcp_mainloop(cls):
         while True:
             pkt = cls.sock.get_packet(True)
 
-            if pkt[2].opcode == CLIENT_JOIN:
-                if pkt[2].payload[:16] == cls.client_id:
-                    continue
+            try:
+                if pkt[2].opcode == CLIENT_JOIN:
+                    if pkt[2].payload[:16] == cls.client_id:
+                        continue
 
-                n_rooms = pkt[2].payload[30]
-                r_data = pkt[2].payload[31:31 + n_rooms]
-                payload_rest = pkt[2].payload[31 + n_rooms:]
-                name_l = payload_rest[0]
-                name = payload_rest[1:1 + name_l].decode('latin-1')
+                    n_rooms = pkt[2].payload[30]
+                    r_data = pkt[2].payload[31:31 + n_rooms]
+                    payload_rest = pkt[2].payload[31 + n_rooms:]
+                    name_l = payload_rest[0]
+                    name = payload_rest[1:1 + name_l].decode('latin-1')
 
-                cls.clients[pkt[2].payload[:16]] = [
-                    list(struct.unpack('!4H', pkt[2].payload[16:24])),
-                    list(struct.unpack('!3H', pkt[2].payload[24:30])),
-                    name
-                ]
-                for i in r_data:
-                    while i >= len(cls.rooms):
-                        cls.rooms.append([])
-                    cls.rooms[i].append(pkt[2].payload[:16])
+                    cls.clients[pkt[2].payload[:16]] = [
+                        list(struct.unpack('!4H', pkt[2].payload[16:24])),
+                        list(struct.unpack('!3H', pkt[2].payload[24:30])),
+                        name
+                    ]
+                    for i in r_data:
+                        while i >= len(cls.rooms):
+                            cls.rooms.append([])
+                        cls.rooms[i].append(pkt[2].payload[:16])
 
-                cls.signals.reload_rooms.emit()
+                    cls.signals.reload_rooms.emit()
+                elif pkt[2].opcode == GET_RECORD:
+                    cls.on_get_record(pkt[2].payload)
+            except:
+                import traceback
+                traceback.print_exc()
+            
+    @staticmethod
+    def on_get_record(payload):
+        pass
 
     @classmethod
     def setup(cls):
         cls.sock.connect(SERVER, CONTROL_PORT)
         cls.sock.start()
         cls.sock.use_special_encryption = True
-        cls.sock.do_tcp_client_auth()
+        client_id = cls.sock.do_tcp_client_auth()
 
         cls.client_sock.connect(SERVER, TCP_PORT)
         cls.client_sock.use_special_encryption = True
@@ -197,9 +237,9 @@ class Spoiler(QWidget):
         self.contentArea.setMinimumHeight(0)
         # Let the entire widget grow and shrink with its content
         self.toggleAnimation = QParallelAnimationGroup()
-        self.toggleAnimation.addAnimation(QPropertyAnimation(self, "minimumHeight"))
-        self.toggleAnimation.addAnimation(QPropertyAnimation(self, "maximumHeight"))
-        self.toggleAnimation.addAnimation(QPropertyAnimation(self.contentArea, "maximumHeight"))
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self, b"minimumHeight"))
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self, b"maximumHeight"))
+        self.toggleAnimation.addAnimation(QPropertyAnimation(self.contentArea, b"maximumHeight"))
         # Don't waste space
         main_layout = QGridLayout()
         main_layout.setVerticalSpacing(0)
@@ -291,8 +331,10 @@ class MetadataListModel(QAbstractListModel):
 
         self.source = source
 
-        self.setSupportedDragActions(Qt.CopyAction if self.source else Qt.MoveAction)
         self.sort(0)
+    
+    def supportedDragActions(self):
+        return Qt.CopyAction if self.source else Qt.MoveAction
 
     # Custom methods
     def add_item(self, text, tooltip=None, metadata=None):
@@ -645,9 +687,10 @@ class CompChart(AudioChart):
 
 
 class ClientWindow(QMainWindow):
-    def __init__(self, parent):
+    def __init__(self, parent, rec):
         super().__init__(parent)
         self.target_client_id = None
+        self.rec = rec
 
         self.layout = VBox(self)
         self.setCentralWidget(self.layout)
@@ -666,7 +709,10 @@ class ClientWindow(QMainWindow):
 
         # Client setup
         self.client_name = QLineEdit(self.setup_sp, placeholderText='Display Name')
+        self.o_rec = QPushButton("Open Recorder", self.setup_sp, )
+        self.o_rec.clicked.connect(self.open_rec)
         self.setup_sp.addWidget(self.client_name)
+        self.setup_sp.addWidget(self.o_rec)
         self.client_name.textChanged.connect(self.name_changed)
 
         # Gate setup
@@ -710,6 +756,10 @@ class ClientWindow(QMainWindow):
         self.u_timer = QTimer()
         self.u_timer.timeout.connect(self.move_blobs)
         self.u_timer.start(10)
+
+    def open_rec(self):
+        self.rec.target_client_id = self.target_client_id
+        self.rec.show()
 
     def name_changed(self, new_name):
         if self.target_client_id is None:
@@ -769,9 +819,112 @@ class ClientWindow(QMainWindow):
         self.target_client_id = None
 
 
+class CircleButton(QPushButton):
+    RED = QColor(224, 73, 72)
+    BLUE = QColor(72, 95, 224)
+    GREEN = QColor(72, 224, 108)
+
+    REC = 0
+    STOP = 1
+    PAUSE = 2
+    PLAY = 3
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.setStyleSheet(ROUND_BUTTON)
+        self.state = self.PLAY
+    
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        qp = QPainter()
+        qp.begin(self)
+
+        if self.state == self.REC:
+            qp.setBrush(QBrush(self.RED, Qt.SolidPattern))
+            qp.setPen(Qt.NoPen)
+            qp.setRenderHint(QPainter.Antialiasing)
+            qp.drawEllipse(42, 42, 40, 40)
+        elif self.state == self.STOP:
+            qp.fillRect(42, 42, 40, 40, QBrush(self.BLUE))
+        elif self.state == self.PAUSE:
+            qp.fillRect(42, 42, 16, 40, QBrush(self.GREEN))
+            qp.fillRect(64, 42, 16, 40, QBrush(self.GREEN))
+        elif self.state == self.PLAY:
+            path = QPainterPath()
+            path.moveTo(44, 42)
+            path.lineTo(44, 82)
+            path.lineTo(82, 62)
+            path.lineTo(44, 42)
+            qp.fillPath(path, QBrush(self.GREEN))
+
+        qp.end()
+
+
+class RecorderWindow(QMainWindow):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.target_client_id = None
+
+        self.layout = VBox(self)
+        self.setCentralWidget(self.layout)
+        self.setWindowTitle('Recorder')
+        self.setWindowFlags(Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint)
+        self.resize(500, 200)
+
+        self.rows = VBox(self, Qt.AlignTop)
+
+        buttons = HBox(self)
+        self.buttons = [
+            CircleButton(buttons),
+            CircleButton(buttons),
+            CircleButton(buttons)
+        ]
+        for i in self.buttons:
+            buttons.addWidget(i)
+        self.buttons[0].state = CircleButton.REC
+        self.buttons[1].state = CircleButton.STOP
+        self.buttons[2].state = CircleButton.PLAY
+        self.buttons[0].clicked.connect(self.start_rec)
+        self.buttons[1].clicked.connect(self.stop_rec)
+        self.rows.addWidget(buttons)
+
+        self.status = QLabel("Not recording", self.rows)
+        self.rows.addWidget(self.status)
+
+        self.layout.addWidget(self.rows)
+
+        def on_get_record(payload):
+            self.status.setText(payload.decode('latin-1'))
+        SocketManager.on_get_record = on_get_record
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(50)
+
+    def start_rec(self):
+        SocketManager.sock.send_packet(START_RECORD, self.target_client_id)
+        self.tick()
+
+    def stop_rec(self):
+        SocketManager.sock.send_packet(STOP_RECORD, self.target_client_id)
+        self.tick()
+
+    def tick(self):
+        if not self.target_client_id:
+            return
+        SocketManager.sock.send_packet(GET_RECORD, self.target_client_id)
+
+    def closeEvent(self, event):
+        self.target_client_id = None
+
+
 class Window(QMainWindow):
     def __init__(self, app):
         super().__init__()
+
+        self.rec = RecorderWindow(self)
 
         SocketManager.setup()
 
@@ -781,7 +934,7 @@ class Window(QMainWindow):
         self.build_menubar()
 
         self.rooms_pane = RoomsPane(self)
-        self.client_window = ClientWindow(self)
+        self.client_window = ClientWindow(self, self.rec)
 
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self.rooms_pane, 'Rooming')

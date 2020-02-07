@@ -346,8 +346,6 @@ static PyTypeObject GateType = {
 
 
 static PyMethodDef ModuleMethods[] = {
-    // {"system",  spam_system, METH_VARARGS, "Execute a shell command."},
-
     {NULL, NULL, 0, NULL}
 };
 

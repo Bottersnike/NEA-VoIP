@@ -12,6 +12,7 @@ AES_CHECK = 5
 AUDIO = 10
 REGISTER_UDP = 11
 
+# Control surface
 SET_GATE = 12
 SET_COMP = 13
 SET_ACK = 14
@@ -20,13 +21,6 @@ CLIENT_JOIN = 16
 CLIENT_LEAVE = 17
 SET_NAME = 18
 SET_ROOMS = 19
-
-"""
-Handshake packet flow is:
-    HELLO ->
-    -> ACK
-    RSA_KEY ->
-    -> AES_KEY
-    AES_CHECK ->
-    -> ACK
-"""
+START_RECORD = 20
+STOP_RECORD = 21
+GET_RECORD = 22

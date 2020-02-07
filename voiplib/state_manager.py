@@ -1,5 +1,10 @@
 import struct
+import time
+from typing import Tuple, List
+from socket import socket
 
+from .socket_controller import SocketController
+from .key_manager import KeyManager
 from .opcodes import *
 
 
@@ -15,7 +20,15 @@ class StateManager:
 
     DEFAULT_NAME = 'Nameless?'
 
-    def __init__(self, sock, cont_sock, km):
+    def __init__(self, sock: SocketController, cont_sock: SocketController,
+                 km: KeyManager):
+        """
+        Create a new instance of a state manager.
+
+        :param SocketController sock: The standard socket to manage
+        :param SocketController cont_sock: The controll server socket to manage
+        :param KeyManager km: The key manager responsible for this connection.
+        """
         self.gates = {}
         self.compressors = {}
         self.names = {}
@@ -29,7 +42,14 @@ class StateManager:
         self._cont_sock = cont_sock
         self._cont_sock.cont_state_manager = self
 
-    def new_cont_client(self, _, __, client_id):
+    def new_cont_client(self, _, __, client_id: bytes) -> None:
+        """
+        A hook bound to a socket controller, called when a new control surface
+        connects.
+        """
+        # Deal with race conditions
+        time.sleep(0.5)
+
         for ci in self.gates:
             r_data = bytearray([n for n in range(len(self.rooms)) if ci in self.rooms[n]])
             r_data.insert(0, len(r_data))
@@ -41,10 +61,12 @@ class StateManager:
                 self._cont_sock.send_packet(
                     CLIENT_JOIN,
                     ci + struct.pack('!7H', *gate, *comp) + r_data + name,
-                    to=client_id
                 )
 
-    def new_client(self, _, __, client_id):
+    def new_client(self, _, __, client_id: bytes) -> None:
+        """
+        A hook bound to a socket controller, called when a new client connects.
+        """
         if client_id not in self.gates:
             self.gates[client_id] = self.DEFAULT_GATE
             self.compressors[client_id] = self.DEFAULT_COMP
@@ -80,10 +102,15 @@ class StateManager:
 
         self._cont_sock.send_packet(
             CLIENT_JOIN,
-            client_id + struct.pack('!7H', *self.gates[client_id], *self.compressors[client_id]) + r_data + name
+            client_id + struct.pack('!7H', *self.gates[client_id],
+                                    *self.compressors[client_id])
+                      + r_data + name
         )
 
-    def set_rooms(self, client_id, rooms):
+    def set_rooms(self, client_id: bytes, rooms: List[int]) -> None:
+        """
+        Set the rooming state for a given client.
+        """
         for i in rooms:
             while i >= len(self.rooms):
                 self.rooms.append([])
@@ -94,16 +121,30 @@ class StateManager:
             elif client_id not in i and n in rooms:
                 i.append(client_id)
 
-    def set_name(self, client_id, name):
+    def set_name(self, client_id: bytes, name: str) -> None:
+        """
+        Set the name for a given client
+        """
         self.names[client_id] = name
 
-    def set_gate(self, client_id, gate):
+    def set_gate(self, client_id: bytes, gate: Tuple) -> None:
+        """
+        Set the gate configuration for a given client
+        """
         self.gates[client_id] = gate
 
-    def set_compressor(self, client_id, compressor):
+    def set_compressor(self, client_id: bytes, compressor: Tuple) -> None:
+        """
+        Set the compressor configuration for a given client
+        """
         self.compressors[client_id] = compressor
 
-    def lost(self, sock, _):
+    def lost(self, sock: socket, _) -> None:
+        """
+        This is a hook bound to a socket controller, called when a TCP client
+        disconnects from a server. It is responsible for cleaning up the state
+        for that, now disconnected, client.
+        """
         client_id = self.km.id_from_sock(sock)
         if client_id is None:
             return
